@@ -28,20 +28,42 @@ custom_tour_state!(TerritoryRouteLoad typeof Float);
 /// quarter to a third of quota, which is what the territory fixtures produce, it drops the balance
 /// term to 27-33% of its linear weight and transport cost outbids it.
 ///
-/// The value is bracketed from both sides and there is no room to round it off. Too low and the
-/// balance fixtures stop balancing (`territory_forms_balanced_clusters_from_shared_start` and
-/// `territory_balances_for_each_metric` settle on a 2/4 split); too high and PUSH outbids the power
-/// weights the weight fixtures are calibrated against (`supplied_weights_pull_work_toward_the_heavier_driver`
-/// settles on that same 2/4 instead of reaching 1/5). Probing the vrp-pragmatic suite puts the green
-/// window at roughly [2.9, 3.33]: it fails at 2.8 on balance and at 3.4 on weights. The upper edge is
-/// analytic — that fixture's second job crossing costs `60 × GAIN` against a power weight worth 200,
-/// so the gain must stay under 10/3. 3.0 sits inside with margin at both ends, and is where the
-/// convex term exactly matches its old linear weight at the balance fixture's operating point
-/// (surplus 1, quota 3).
+/// Bracketed from both sides by the vrp-pragmatic fixtures, and there is no room to round it off.
+/// Both edges are the tipping point of one discrete "move this job or leave it" decision on a
+/// six-job problem, so both are analytic and both were located to four decimals:
+///
+/// - **Low, 35/12 ≈ 2.9167**, from `territory_balances_for_each_metric`'s ProductionValue arm.
+///   Values 2,3 | 3,3,2,2 over two equal drivers ⇒ `avg_metric` 2.5, quota 7.5 each, anchors 60
+///   apart, and the cost-only split is 5/10. Leaving it there is a surplus of 2.5 ⇒
+///   `(2.5/2.5) × GAIN × (2.5/7.5) × 60 = 20 × GAIN`, with no PULL. Moving driver1's boundary job
+///   (value 3, sitting 2 from its own anchor and 58 from driver0's) leaves a surplus of 0.5 ⇒
+///   `(0.5/2.5) × GAIN × (0.5/7.5) × 60 = 0.8 × GAIN`, plus `58 − 2 = 56` of PULL. Balancing wins
+///   only while `20 × GAIN > 0.8 × GAIN + 56`, i.e. `GAIN > 56/19.2`. Below it the arm settles back
+///   on 5/10.
+/// - **High, 10/3 ≈ 3.3333**, from `supplied_weights_pull_work_toward_the_heavier_driver` (with
+///   `supplied_weights_ignore_unknown_keys_and_default_absent_drivers_to_zero` failing alongside
+///   it). That fixture's second job crossing costs `60 × GAIN` against a power weight worth 200, so
+///   above 10/3 PUSH outbids the supplied weights and the split settles on 2/4 instead of 1/5.
+///
+/// Measured: 2.9166 red / 2.9167 green, 3.33 green / 3.34 red, each side unanimous over repeated
+/// runs. 3.0 sits inside. The vrp-core unit tests then pin it exactly rather than bracket it —
+/// `derived_quotas_produce_exact_pull_and_push` and friends assert PUSH totals worked out at this
+/// value — so moving the gain means recomputing those numbers, not just re-probing the window.
+///
+/// Normalizing the PUSH fitness by `avg_metric` (see [`TerritoryShared::push`]) left the *upper*
+/// edge and every Activities-driven edge exactly where they were — `avg_metric` is 1 when the metric
+/// is activity count, so the division is the identity there, and
+/// `territory_forms_balanced_clusters_from_shared_start` still fails at 2.8 and passes at 2.85 as
+/// before. What moved is which fixture binds from below. The same equation without the
+/// `/avg_metric` reads `50 × GAIN > 2 × GAIN + 56`, i.e. `GAIN > 7/6` — well under the Activities
+/// edge, so the ProductionValue arm never bound. Normalizing lifted it by exactly `avg_metric` (2.5)
+/// to 35/12, which lands just past that edge. So the window is near enough the one the raw-sum
+/// formula had, now held from below by a different constraint — which is the point: with both terms
+/// in jobs × distance, this gain no longer means something different per balance metric.
 ///
 /// Those pragmatic fixtures drive a stochastic solver (`Environment::default()` seeds
-/// `DefaultRandom` from entropy, not a fixed seed), so the window's edges are soft. Treat a single
-/// red run near an edge as evidence, not proof.
+/// `DefaultRandom` from entropy, not a fixed seed), so treat a single red run near an edge as
+/// evidence, not proof — though on these two edges the seed never changed the verdict.
 const PUSH_CONVEXITY_GAIN: Float = 3.0;
 
 /// Distance metric used to measure how far a job sits from a driver's anchor.
@@ -333,9 +355,11 @@ struct TerritoryShared {
     /// which the location-aware PUSH marginal uses to prefer shedding boundary jobs over deep ones.
     job_second_power: HashMap<String, Float>,
     /// The average balance metric per job (`total_metric / job_count`, floored positive). Divides
-    /// the raw job metric in the PUSH marginal so its magnitude lives on the same (distance) scale
-    /// as PULL instead of `value × distance`, which otherwise dwarfs PULL by the value magnitude
-    /// and makes the balance pressure ignore where a job sits.
+    /// the raw job metric in the PUSH marginal AND the surplus in the PUSH fitness, so both live on
+    /// the same (distance) scale as PULL instead of `value × distance`, which otherwise dwarfs PULL
+    /// by the value magnitude and makes the balance pressure ignore where a job sits. Estimate and
+    /// fitness must share this normalization or the estimate steers on a different exchange rate
+    /// than the fitness it approximates.
     avg_metric: Float,
     /// The PUSH marginal's reach: the median per-job power gap. A job whose gap exceeds this sits
     /// too deep in its cell to be worth shedding for balance, so its PUSH marginal is zero (it stays
@@ -706,6 +730,14 @@ impl TerritoryShared {
     /// anchor. It is not a transport bound — nothing is routed and deficit capacity is ignored — it
     /// prices imbalance and lets distance say where imbalance hurts most. Zero when no driver is
     /// over quota.
+    ///
+    /// The surplus is expressed in *jobs*, not in raw balance metric: it is divided by `avg_metric`
+    /// exactly as [`Self::push_marginal`] divides the job metric. PULL sums a proximity per job, so
+    /// without that division a solution balancing production value would add dollars × metres to
+    /// metres, and the ratio between the two terms would be set by the average job value — a
+    /// property of the caller's price list, not of how much balance was asked for. Normalized, both
+    /// terms are jobs × metres and [`PUSH_CONVEXITY_GAIN`] means the same thing whatever the metric
+    /// is measured in.
     fn push(&self, solution: &SolutionContext) -> Cost {
         if self.balance.is_none() || self.quotas.is_empty() {
             return 0.0;
@@ -739,12 +771,17 @@ impl TerritoryShared {
         }
 
         let mut total = 0.0;
-        // The surplus term is quadratic, normalised by the quota so the unit stays value × distance
-        // and scaled by [`PUSH_CONVEXITY_GAIN`] so convexity is not bought by lowering the curve.
-        // A term linear in surplus has its optimum in a corner: stacking all the imbalance on the one
-        // driver nearest a deficit anchor is then cheaper than spreading it, so the objective
-        // produced the outlier it exists to prevent. A rising marginal price makes spreading cheaper
-        // than stacking.
+        // The leading surplus is divided by `avg_metric`, so it reads as "how many jobs' worth of
+        // value sits in the wrong hands" rather than a raw amount of the balance metric. That puts
+        // PUSH in the same jobs × distance unit as PULL (which sums a proximity per job) and as
+        // [`Self::push_marginal`] (which already divides by `avg_metric`), so the three can be added
+        // and compared without the tenant's price list setting the exchange rate between them.
+        // The second factor is the shape, not the unit: `surplus / quota` is dimensionless and
+        // independent of problem size, and [`PUSH_CONVEXITY_GAIN`] keeps convexity from being bought
+        // by lowering the curve. A term linear in surplus has its optimum in a corner: stacking all
+        // the imbalance on the one driver nearest a deficit anchor is then cheaper than spreading it,
+        // so the objective produced the outlier it exists to prevent. A rising marginal price makes
+        // spreading cheaper than stacking.
         // Again `driver_order`: this is a float sum, so its rounding depends on the fold order.
         for key in self.driver_order.iter() {
             let Some(&quota) = quotas.get(key) else { continue };
@@ -768,7 +805,7 @@ impl TerritoryShared {
             // A zero quota has no scale to normalise against, and it is already maximal imbalance —
             // nothing about it should be softened, so the term stays linear there.
             let convexity = if quota > 1e-9 { PUSH_CONVEXITY_GAIN * surplus / quota } else { 1.0 };
-            total += surplus * convexity * nearest;
+            total += (surplus / self.avg_metric) * convexity * nearest;
         }
         total
     }

@@ -328,10 +328,11 @@ fn allow_idle_drivers_drops_the_idle_driver_from_the_imbalance() {
 /// - `balanced` (one job per driver): both loads sit on quota ⇒ no surplus ⇒ PUSH 0; each job sits
 ///   on its own nearest anchor ⇒ PULL 0.
 /// - `overloaded` (both jobs on "d0", "d1" idle): surplus 1 against a quota of 1, billed at the
-///   only deficit anchor's π(0, 100) = 100. PUSH is convex in surplus — `surplus × gain × surplus /
-///   quota × π` — and this fixture sits at surplus == quota, so the convexity factor is the whole
-///   [`PUSH_CONVEXITY_GAIN`] of 3 ⇒ PUSH 1 × 3 × 100 = 300; job_far@95 served from anchor 0 reaches
-///   95 − 5 = 90 ⇒ PULL 90.
+///   only deficit anchor's π(0, 100) = 100. PUSH is convex in surplus —
+///   `surplus / avg_metric × gain × surplus / quota × π` — and this fixture sits at surplus ==
+///   quota, so the convexity factor is the whole [`PUSH_CONVEXITY_GAIN`] of 3. The metric is
+///   activity count, so `avg_metric` is 1 and the leading normalization is the identity here ⇒
+///   PUSH 1 × 3 × 100 = 300; job_far@95 served from anchor 0 reaches 95 − 5 = 90 ⇒ PULL 90.
 #[test]
 fn derived_quotas_produce_exact_pull_and_push() {
     let (_f, ctx) = territory_balanced_fixture(TerritoryBalance::Activities, false);
