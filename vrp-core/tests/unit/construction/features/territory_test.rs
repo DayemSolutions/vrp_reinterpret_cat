@@ -26,11 +26,22 @@ struct TerritoryFixtureContexts {
 }
 
 fn build_vehicle(id: &str, driver_id: &str) -> crate::models::problem::Vehicle {
+    build_vehicle_with_shifts(id, driver_id, 1)
+}
+
+/// [`build_vehicle`] over `shifts` identical `[0, 1000]` shift windows. Each detail becomes its own
+/// `Actor` (see `Fleet::new`), so a driver built with two shifts is two actors — hence two routes —
+/// carrying one shared, horizon-wide quota between them.
+fn build_vehicle_with_shifts(id: &str, driver_id: &str, shifts: usize) -> crate::models::problem::Vehicle {
     let mut builder = TestVehicleBuilder::default();
-    builder.id(id).details(vec![VehicleDetail {
-        start: Some(VehiclePlace { location: 0, time: TimeInterval { earliest: Some(0.0), latest: None } }),
-        end: Some(VehiclePlace { location: 0, time: TimeInterval { earliest: None, latest: Some(1000.0) } }),
-    }]);
+    builder.id(id).details(
+        (0..shifts)
+            .map(|_| VehicleDetail {
+                start: Some(VehiclePlace { location: 0, time: TimeInterval { earliest: Some(0.0), latest: None } }),
+                end: Some(VehiclePlace { location: 0, time: TimeInterval { earliest: None, latest: Some(1000.0) } }),
+            })
+            .collect(),
+    );
     builder.dimens_mut().set_driver_id(driver_id.to_string());
     builder.build()
 }
@@ -316,8 +327,11 @@ fn allow_idle_drivers_drops_the_idle_driver_from_the_imbalance() {
 /// cannot quietly move them. Two equal-window drivers and two activities ⇒ derived quota 1.0 each:
 /// - `balanced` (one job per driver): both loads sit on quota ⇒ no surplus ⇒ PUSH 0; each job sits
 ///   on its own nearest anchor ⇒ PULL 0.
-/// - `overloaded` (both jobs on "d0", "d1" idle): surplus 1 shipped to the only deficit anchor at
-///   π(0, 100) = 100 ⇒ PUSH 100; job_far@95 served from anchor 0 reaches 95 − 5 = 90 ⇒ PULL 90.
+/// - `overloaded` (both jobs on "d0", "d1" idle): surplus 1 against a quota of 1, billed at the
+///   only deficit anchor's π(0, 100) = 100. PUSH is convex in surplus — `surplus × gain × surplus /
+///   quota × π` — and this fixture sits at surplus == quota, so the convexity factor is the whole
+///   [`PUSH_CONVEXITY_GAIN`] of 3 ⇒ PUSH 1 × 3 × 100 = 300; job_far@95 served from anchor 0 reaches
+///   95 − 5 = 90 ⇒ PULL 90.
 #[test]
 fn derived_quotas_produce_exact_pull_and_push() {
     let (_f, ctx) = territory_balanced_fixture(TerritoryBalance::Activities, false);
@@ -328,14 +342,16 @@ fn derived_quotas_produce_exact_pull_and_push() {
     assert_eq!(balanced.pull, 0.0);
     assert_eq!(balanced.push, 0.0);
     assert_eq!(overloaded.pull, 90.0);
-    assert_eq!(overloaded.push, 100.0);
+    assert_eq!(overloaded.push, 300.0);
 }
 
 /// Reads the caller's quota verbatim rather than merging it with, or correcting it against, the
 /// derived one. The derived quota here is 1.0 per driver (pinned above), so supplying
 /// `{d0: 2, d1: 0}` inverts which layout is balanced:
 /// - `balanced` (one job each): "d1" is now 1.0 over its zero quota while "d0" is a deficit, so the
-///   surplus ships at π(100, 0) = 100 ⇒ PUSH 100, where the derived quota gave 0.
+///   surplus ships at π(100, 0) = 100 ⇒ PUSH 100, where the derived quota gave 0. A quota of exactly
+///   zero has no scale to normalize the convex term against and is already maximal imbalance, so
+///   PUSH stays linear there and the number is the same one the linear formula gave.
 /// - `overloaded` (both jobs on "d0"): "d0" sits exactly on its quota of 2 and idle "d1" is not
 ///   below its quota of 0, so nothing is surplus ⇒ PUSH 0, where the derived quota gave 100.
 #[test]
@@ -362,7 +378,7 @@ fn empty_supplied_quotas_reproduce_the_derivation() {
     assert_eq!(balanced.pull, 0.0);
     assert_eq!(balanced.push, 0.0);
     assert_eq!(overloaded.pull, 90.0);
-    assert_eq!(overloaded.push, 100.0);
+    assert_eq!(overloaded.push, 300.0);
 }
 
 /// A key matching no driver in the fleet is dropped, never fatal: it cannot be keyed to any route,
@@ -416,14 +432,15 @@ fn driver_absent_from_supplied_quotas_is_left_out_of_the_balance() {
 /// not ask for. Same overloaded layout as
 /// `allow_idle_drivers_drops_the_idle_driver_from_the_imbalance` (both jobs on "d0", "d1" idle),
 /// which the DERIVED path re-bases onto "d0" alone (quota 2) for PUSH 0. With an explicit 1/1 quota
-/// there is no re-basing: "d0" is 1 over and idle "d1" is a deficit ⇒ PUSH 100.
+/// there is no re-basing: "d0" is 1 over its quota of 1 and idle "d1" is a deficit ⇒ PUSH
+/// 1 × 3 × 100 = 300 (surplus == quota, so the convex factor is the full gain).
 #[test]
 fn supplied_quotas_are_not_rebased_when_idle_drivers_are_allowed() {
     let quotas = HashMap::from([("d0".to_string(), 1.0), ("d1".to_string(), 1.0)]);
     let (_f, ctx) = territory_balanced_fixture_with_quotas(TerritoryBalance::Activities, true, quotas);
 
     let data = ctx.overloaded.solution.state.get_territory_fitness().cloned().unwrap_or_default();
-    assert_eq!(data.push, 100.0);
+    assert_eq!(data.push, 300.0);
 }
 
 /// Weighted power cells: a job physically closer (raw distance) to d0's anchor is pulled into
@@ -444,8 +461,7 @@ fn weight_moves_the_boundary_and_zeroes_pull_in_the_power_cell() {
     let job = TestSingleBuilder::default().id("job_boundary").location(Some(40)).build_shared();
 
     let transport = TestTransportCost::new_shared();
-    let jobs =
-        Arc::new(Jobs::new(&fleet, vec![Job::Single(job.clone())], transport.as_ref(), &test_logger()).unwrap());
+    let jobs = Arc::new(Jobs::new(&fleet, vec![Job::Single(job.clone())], transport.as_ref(), &test_logger()).unwrap());
 
     let anchors = HashMap::from([("d0".to_string(), vec![0usize]), ("d1".to_string(), vec![100usize])]);
     // w_d1 = 30: power(d0) = 40 - 0 = 40, power(d1) = 60 - 30 = 30 -> job belongs to d1's cell.
@@ -467,8 +483,7 @@ fn weight_moves_the_boundary_and_zeroes_pull_in_the_power_cell() {
     let objective = feature.objective.unwrap();
 
     // On d1 (its power cell): power(d1) - min_power = 30 - 30 = 0.
-    let on_d1 =
-        TestInsertionContextBuilder::default().with_routes(vec![route_with(actor_d1, job.clone(), 40)]).build();
+    let on_d1 = TestInsertionContextBuilder::default().with_routes(vec![route_with(actor_d1, job.clone(), 40)]).build();
     assert_eq!(objective.fitness(&on_d1), 0.0);
 
     // On d0 (foreign cell): power(d0) - min_power = 40 - 30 = 10.
@@ -634,6 +649,107 @@ fn push_marginal_sheds_boundary_jobs_not_deep_ones() {
     assert!(deep > 0.0, "a mid-depth job still carries some pressure");
 }
 
+/// A driver with TWO shifts is two actors, hence two routes, while its quota spans the whole
+/// horizon. `push_marginal` compared ONE route's load against that horizon-wide quota, so a single
+/// day's load could never exceed a whole horizon's worth and the per-insertion shedding pressure was
+/// inert in every multi-day problem. No other fixture reaches this: they all give each driver a
+/// single shift, where the route's share IS the whole quota and the two readings coincide.
+///
+/// "d0" holds two shifts (capacity 2000) against "d1"'s one (1000), so of the six activities "d0"
+/// draws a horizon quota of `6 × 2000/3000 = 4` and "d1" one of 2. One of "d0"'s two routes carries
+/// three of the jobs:
+/// - against the horizon quota of 4, a load of 3 is inside the band ⇒ the old comparison returned
+///   0.0, asserted below as the control so this cannot pass by accident;
+/// - against this route's share, `4 × 1000/2000 = 2`, the load is 1 over ⇒ pressure fires.
+///
+/// The value: the marginal is the derivative of the convex fitness, `2 × GAIN × surplus / quota`,
+/// so with `surplus_ratio = (3 − 2)/2 = 0.5` and a gain of 3 the price factor is `2 × 3 × 0.5 = 3`.
+/// The probe job "bound"@45 has power gap `55 − 45 = 10` against a `push_reach` of 94 (the median of
+/// the six gaps 98, 96, 94, 92, 90, 10), and `value_factor` is 1 (Activities, so metric and average
+/// are both 1) ⇒ `1 × 3 × 84 = 252`. PULL is 0 for that job — it sits in d0's own cell — so the
+/// estimate is the marginal alone.
+#[test]
+fn push_marginal_fires_when_one_shift_of_several_is_over_its_share() {
+    let vehicle_d0 = build_vehicle_with_shifts("v_d0", "d0", 2);
+    let vehicle_d1 = build_vehicle_with_shifts("v_d1", "d1", 1);
+    let fleet =
+        FleetBuilder::default().add_driver(test_driver()).add_vehicle(vehicle_d0).add_vehicle(vehicle_d1).build();
+
+    let actors_of = |driver: &str| -> Vec<Arc<Actor>> {
+        fleet
+            .actors
+            .iter()
+            .filter(|actor| actor.vehicle.dimens.get_driver_id().map(String::as_str) == Some(driver))
+            .cloned()
+            .collect()
+    };
+    let d0_actors = actors_of("d0");
+    let d1_actors = actors_of("d1");
+    assert_eq!((d0_actors.len(), d1_actors.len()), (2, 1), "two shifts must yield two actors");
+
+    let specs = [("f1", 1), ("f2", 2), ("f3", 3), ("f4", 4), ("deep", 5), ("bound", 45)];
+    let singles: Vec<Arc<Single>> =
+        specs.iter().map(|(id, loc)| TestSingleBuilder::default().id(id).location(Some(*loc)).build_shared()).collect();
+
+    let transport = TestTransportCost::new_shared();
+    let jobs = Arc::new(
+        Jobs::new(&fleet, singles.iter().cloned().map(Job::Single).collect(), transport.as_ref(), &test_logger())
+            .unwrap(),
+    );
+
+    let anchors = HashMap::from([("d0".to_string(), vec![0usize]), ("d1".to_string(), vec![100usize])]);
+    let all_actors: Vec<Arc<Actor>> = d0_actors.iter().chain(d1_actors.iter()).cloned().collect();
+
+    // Built directly, because the horizon quota and the capacities are the control this test turns
+    // on and neither is reachable through `Feature`.
+    let shared = TerritoryShared::new(
+        transport.clone(),
+        all_actors.clone(),
+        jobs.clone(),
+        Arc::new(|_: &Job, _: &Actor| true),
+        TerritoryProximity::Distance,
+        Some(TerritoryBalance::Activities),
+        0.0,
+        anchors.clone(),
+        HashMap::new(),
+        HashMap::new(),
+        Arc::new(|_: &Job| 1.0),
+        false,
+    );
+    assert_eq!(shared.caps.get("d0").copied(), Some(2000.0), "two shifts of 1000 each");
+    assert_eq!(shared.caps.get("d1").copied(), Some(1000.0));
+    assert_eq!(shared.quotas.get("d0").copied(), Some(4.0), "the quota spans the driver's whole horizon");
+
+    let feature = TerritoryFeatureBuilder::new("territory")
+        .set_transport(transport)
+        .set_actors(all_actors)
+        .set_jobs(jobs)
+        .set_compatibility_fn(|_, _| true)
+        .set_proximity(TerritoryProximity::Distance)
+        .set_balance(Some(TerritoryBalance::Activities))
+        .set_anchors(anchors)
+        .build()
+        .unwrap();
+    let objective = feature.objective.as_ref().unwrap();
+
+    // One of d0's two routes carries three of the six jobs.
+    let mut route_ctx = route_with_jobs(
+        d0_actors[0].clone(),
+        vec![(singles[0].clone(), 1), (singles[1].clone(), 2), (singles[2].clone(), 3)],
+    );
+    feature.state.as_ref().unwrap().accept_route_state(&mut route_ctx);
+
+    // The control: measured against the horizon quota the route is INSIDE the band, which is exactly
+    // why the old reading returned zero here.
+    assert!(3.0 <= shared.over_quota(4.0), "the horizon-wide comparison must be inert on this fixture");
+
+    let ictx = TestInsertionContextBuilder::default().build();
+    let estimate =
+        objective.estimate(&MoveContext::route(&ictx.solution, &route_ctx, &Job::Single(singles[5].clone())));
+
+    assert_eq!(estimate, 252.0, "the route is over ITS share of the quota, so the marginal must fire");
+}
+
 /// The deadband also gates the per-insertion PUSH marginal: with the driver inside the (widened)
 /// band it is not over quota, so even a boundary job carries no shedding pressure.
 #[test]
@@ -668,8 +784,7 @@ fn skill_forced_far_assignment_is_not_penalized() {
     let job = TestSingleBuilder::default().id("job_skill").location(Some(10)).build_shared();
 
     let transport = TestTransportCost::new_shared();
-    let jobs =
-        Arc::new(Jobs::new(&fleet, vec![Job::Single(job.clone())], transport.as_ref(), &test_logger()).unwrap());
+    let jobs = Arc::new(Jobs::new(&fleet, vec![Job::Single(job.clone())], transport.as_ref(), &test_logger()).unwrap());
 
     let anchors = HashMap::from([("d0".to_string(), vec![0usize]), ("d1".to_string(), vec![100usize])]);
 
@@ -808,27 +923,29 @@ fn an_empty_anchor_list_behaves_exactly_like_an_absent_driver() {
     // d0's surplus has nowhere to ship (PUSH 0).
     assert_eq!((empty.pull, empty.push), (0.0, 0.0));
     // The same layout with "d1" actually anchored: job_far reaches 90 past d1's cell, and d0's
-    // surplus of one activity ships to d1 at π(0, 100) = 100.
-    assert_eq!((anchored.pull, anchored.push), (90.0, 100.0));
+    // surplus of one activity against a quota of 1 is billed at π(0, 100) = 100, times the full
+    // convexity gain of 3 (surplus == quota) ⇒ 300.
+    assert_eq!((anchored.pull, anchored.push), (90.0, 300.0));
 }
 
 /// The PUSH ground cost between two drivers is the minimum over their ANCHOR PAIRS, not the distance
 /// between one designated anchor each. Over-quota "d0" holds anchors at 0 and 90; the only deficit
 /// driver "d1" holds one at 100. The nearest pair is (90, 100) = 10, so the surplus of one activity
-/// ships for 10 — against 100 when "d0" holds only its first anchor, asserted as the control.
+/// is billed at 10 — against 100 when "d0" holds only its first anchor, asserted as the control.
+/// Both are then multiplied by the full convexity gain of 3, since surplus == quota here.
 #[test]
 fn push_ground_cost_is_the_minimum_over_anchor_pairs() {
     let near_pair = both_jobs_on_d0_fitness(
         HashMap::from([("d0".to_string(), vec![0, 90]), ("d1".to_string(), vec![100])]),
         Some(TerritoryBalance::Activities),
     );
-    assert_eq!(near_pair.push, 10.0);
+    assert_eq!(near_pair.push, 30.0);
 
     let far_only = both_jobs_on_d0_fitness(
         HashMap::from([("d0".to_string(), vec![0]), ("d1".to_string(), vec![100])]),
         Some(TerritoryBalance::Activities),
     );
-    assert_eq!(far_only.push, 100.0);
+    assert_eq!(far_only.push, 300.0);
 }
 
 // endregion
@@ -950,10 +1067,11 @@ fn derived_quotas_do_not_depend_on_the_hash_seed() {
     }
 }
 
-/// PUSH sums `surplus × (distance to the nearest deficit anchor)` over the drivers, and that sum
-/// went round the quota `HashMap` — so the solution's fitness, not just an internal, moved with the
-/// map's hash seed. Three drivers are over quota (quota `0.0`, one job each) and only "d3" is under
-/// (quota `10.0`, no jobs), so every source ships to "d3"'s anchor at 1:
+/// PUSH sums `surplus × convexity × (distance to the nearest deficit anchor)` over the drivers, and
+/// that sum went round the quota `HashMap` — so the solution's fitness, not just an internal, moved
+/// with the map's hash seed. Three drivers are over quota (quota `0.0`, one job each) and only "d3"
+/// is under (quota `10.0`, no jobs), so every source ships to "d3"'s anchor at 1. A quota of exactly
+/// zero keeps the term linear (`convexity == 1`), so the numbers are the linear ones:
 ///
 /// - "d0" is anchored 1e16 away, so its term is 1e16;
 /// - "d1" (anchor 0) and "d2" (anchor 2) are one unit away, so their terms are 1 each.

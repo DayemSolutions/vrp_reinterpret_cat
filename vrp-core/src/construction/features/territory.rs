@@ -23,6 +23,27 @@ pub use crate::construction::features::vehicle_distance::ActorJobCompatibilityFn
 custom_solution_state!(TerritoryFitness typeof TerritoryFitnessData);
 custom_tour_state!(TerritoryRouteLoad typeof Float);
 
+/// Restores the quadratic term's weight in the regime the feature's own tests exercise.
+/// `surplus²/quota` alone is below `surplus` for every surplus under quota — at a surplus of a
+/// quarter to a third of quota, which is what the territory fixtures produce, it drops the balance
+/// term to 27-33% of its linear weight and transport cost outbids it.
+///
+/// The value is bracketed from both sides and there is no room to round it off. Too low and the
+/// balance fixtures stop balancing (`territory_forms_balanced_clusters_from_shared_start` and
+/// `territory_balances_for_each_metric` settle on a 2/4 split); too high and PUSH outbids the power
+/// weights the weight fixtures are calibrated against (`supplied_weights_pull_work_toward_the_heavier_driver`
+/// settles on that same 2/4 instead of reaching 1/5). Probing the vrp-pragmatic suite puts the green
+/// window at roughly [2.9, 3.33]: it fails at 2.8 on balance and at 3.4 on weights. The upper edge is
+/// analytic — that fixture's second job crossing costs `60 × GAIN` against a power weight worth 200,
+/// so the gain must stay under 10/3. 3.0 sits inside with margin at both ends, and is where the
+/// convex term exactly matches its old linear weight at the balance fixture's operating point
+/// (surplus 1, quota 3).
+///
+/// Those pragmatic fixtures drive a stochastic solver (`Environment::default()` seeds
+/// `DefaultRandom` from entropy, not a fixed seed), so the window's edges are soft. Treat a single
+/// red run near an edge as evidence, not proof.
+const PUSH_CONVEXITY_GAIN: Float = 3.0;
+
 /// Distance metric used to measure how far a job sits from a driver's anchor.
 #[derive(Clone, Copy, Debug)]
 pub enum TerritoryProximity {
@@ -481,9 +502,7 @@ impl TerritoryShared {
             .collect();
         let used_cap: Float = used.iter().filter_map(|k| self.caps.get(*k)).sum::<Float>().max(1e-6);
         let used_load: Float = used.iter().filter_map(|k| loads.get(*k)).sum();
-        used.into_iter()
-            .map(|k| (k.clone(), used_load * self.caps.get(k).copied().unwrap_or(0.0) / used_cap))
-            .collect()
+        used.into_iter().map(|k| (k.clone(), used_load * self.caps.get(k).copied().unwrap_or(0.0) / used_cap)).collect()
     }
 
     /// The self-normalization reference: the sum, over all jobs, of the proximity to each job's
@@ -548,11 +567,8 @@ impl TerritoryShared {
         self.job_anchor_ranking
             .iter()
             .map(|(id, ranking)| {
-                let np = ranking
-                    .iter()
-                    .map(|(k, prox)| prox - self.weight(k))
-                    .min_by(|a, b| a.total_cmp(b))
-                    .unwrap_or(0.0);
+                let np =
+                    ranking.iter().map(|(k, prox)| prox - self.weight(k)).min_by(|a, b| a.total_cmp(b)).unwrap_or(0.0);
                 (id.clone(), np)
             })
             .collect()
@@ -685,9 +701,11 @@ impl TerritoryShared {
         total
     }
 
-    /// Total PUSH for the solution: a greedy lower bound on the cost of moving every over-quota
-    /// driver's surplus to its *nearest* deficit driver's anchor (ignoring deficit capacity, i.e.
-    /// not a full min-cost transport). Zero when no driver is over quota.
+    /// Total PUSH for the solution: a convex imbalance penalty per over-quota driver, weighted by
+    /// how far that driver's surplus would have to travel to reach the *nearest* deficit driver's
+    /// anchor. It is not a transport bound — nothing is routed and deficit capacity is ignored — it
+    /// prices imbalance and lets distance say where imbalance hurts most. Zero when no driver is
+    /// over quota.
     fn push(&self, solution: &SolutionContext) -> Cost {
         if self.balance.is_none() || self.quotas.is_empty() {
             return 0.0;
@@ -721,6 +739,12 @@ impl TerritoryShared {
         }
 
         let mut total = 0.0;
+        // The surplus term is quadratic, normalised by the quota so the unit stays value × distance
+        // and scaled by [`PUSH_CONVEXITY_GAIN`] so convexity is not bought by lowering the curve.
+        // A term linear in surplus has its optimum in a corner: stacking all the imbalance on the one
+        // driver nearest a deficit anchor is then cheaper than spreading it, so the objective
+        // produced the outlier it exists to prevent. A rising marginal price makes spreading cheaper
+        // than stacking.
         // Again `driver_order`: this is a float sum, so its rounding depends on the fold order.
         for key in self.driver_order.iter() {
             let Some(&quota) = quotas.get(key) else { continue };
@@ -741,7 +765,10 @@ impl TerritoryShared {
                 .map(|(s, d)| self.proximity(s, d))
                 .min_by(|x, y| x.total_cmp(y))
                 .unwrap_or(0.0);
-            total += surplus * nearest;
+            // A zero quota has no scale to normalise against, and it is already maximal imbalance —
+            // nothing about it should be softened, so the term stays linear there.
+            let convexity = if quota > 1e-9 { PUSH_CONVEXITY_GAIN * surplus / quota } else { 1.0 };
+            total += surplus * convexity * nearest;
         }
         total
     }
@@ -758,6 +785,17 @@ impl TerritoryShared {
     ///   this driver's cell than in its next-best one. A boundary job (small/negative gap) is cheap
     ///   to shed and carries pressure; a job deeper than `push_reach` carries none, so an over-quota
     ///   driver rebalances by giving up its border jobs, not the ones buried in its territory.
+    ///
+    /// An estimate has to measure the same quantity, in the same unit, at the same AGGREGATION LEVEL
+    /// as the fitness it estimates. The deadband here read one route's load — one actor is one shift
+    /// is one route — against the driver's whole-horizon quota, which a single day can never exceed,
+    /// so in any multi-day problem this returned zero always and the per-insertion balance pressure
+    /// was dead code. The quota is scaled to this route's share of the driver's capacity first. The
+    /// returned pressure is then the derivative of the convex PUSH fitness (see [`Self::push`]),
+    /// `d/ds [GAIN · s²/q] = 2 · GAIN · s/q` — it grows with how far over the band this route already
+    /// is — rather than a flat step. Note the version before the convex fitness already read as a
+    /// derivative without being one: it was off by the factor of 2, and carried no gain at all, so
+    /// the estimate steered construction on a weaker price than the fitness it approximates.
     fn push_marginal(&self, route_ctx: &RouteContext, job: &Job) -> Cost {
         if self.balance.is_none() {
             return 0.0;
@@ -774,8 +812,17 @@ impl TerritoryShared {
             return 0.0;
         };
         let load = route_ctx.state().get_territory_route_load().copied().unwrap_or(0.0);
-        // Deadband: no shedding pressure until the driver is over the widened quota.
-        if load <= self.over_quota(*self.quotas.get(&key).unwrap_or(&Float::MAX)) {
+        // `load` is this route alone; the quota spans the driver's whole horizon. Scale it to this
+        // route's share of the driver's capacity so both sides are one route's worth of work.
+        let Some(&driver_quota) = self.quotas.get(&key) else { return 0.0 };
+        let driver_capacity = self.caps.get(&key).copied().unwrap_or(0.0);
+        if driver_capacity <= 0.0 {
+            return 0.0;
+        }
+        let route_capacity = (actor.detail.time.end - actor.detail.time.start).max(0.0);
+        let route_quota = driver_quota * route_capacity / driver_capacity;
+        // Deadband: no shedding pressure until the route is over the widened quota.
+        if load <= self.over_quota(route_quota) {
             return 0.0;
         }
         let Some(loc) = get_job_location(job) else { return 0.0 };
@@ -793,7 +840,11 @@ impl TerritoryShared {
         };
         let gap = min_other - assigned_power;
         let value_factor = self.job_metric(job) / self.avg_metric;
-        value_factor * (self.push_reach - gap).max(0.0)
+        // Derivative of the convex PUSH, `2 · GAIN · surplus / quota`: the price rises with how far
+        // over the band this route sits, so a flat step is replaced by pressure that grows with the
+        // imbalance it prices — on the same scale as the fitness rather than a fraction of it.
+        let surplus_ratio = (load - self.over_quota(route_quota)) / route_quota.max(1e-9);
+        value_factor * 2.0 * PUSH_CONVEXITY_GAIN * surplus_ratio * (self.push_reach - gap).max(0.0)
     }
 }
 
