@@ -113,6 +113,7 @@ prop_compose! {
           reloads,
           recharges,
           job_times: None,
+          regular_duration: None,
         }
     }
 }

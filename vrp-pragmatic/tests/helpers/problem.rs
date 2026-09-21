@@ -243,6 +243,7 @@ pub fn create_default_open_vehicle_shift() -> VehicleShift {
         reloads: None,
         recharges: None,
         job_times: None,
+        regular_duration: None,
     }
 }
 
@@ -254,11 +255,12 @@ pub fn create_default_vehicle_shift_with_locations(start: (f64, f64), end: (f64,
         reloads: None,
         recharges: None,
         job_times: None,
+        regular_duration: None,
     }
 }
 
 pub fn create_default_vehicle_costs() -> VehicleCosts {
-    VehicleCosts { fixed: Some(10.), distance: 1., time: 1., span: None }
+    VehicleCosts { fixed: Some(10.), distance: 1., time: 1., overtime: None, span: None }
 }
 
 pub fn create_default_vehicle_profile() -> VehicleProfile {

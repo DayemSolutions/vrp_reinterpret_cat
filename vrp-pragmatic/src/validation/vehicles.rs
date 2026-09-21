@@ -160,7 +160,9 @@ fn check_e1304_vehicle_reload_time_is_correct(ctx: &ValidationContext) -> Result
 fn check_e1306_vehicle_has_no_zero_costs(ctx: &ValidationContext) -> Result<(), FormatError> {
     let type_ids = ctx
         .vehicles()
-        .filter(|vehicle| vehicle.costs.time == 0. && vehicle.costs.distance == 0.)
+        .filter(|vehicle| {
+            vehicle.costs.time == 0. && vehicle.costs.distance == 0. && vehicle.costs.overtime.unwrap_or(0.) == 0.
+        })
         .map(|vehicle| vehicle.type_id.to_string())
         .collect::<Vec<_>>();
 
@@ -171,7 +173,7 @@ fn check_e1306_vehicle_has_no_zero_costs(ctx: &ValidationContext) -> Result<(), 
             "E1306".to_string(),
             "time and duration costs are zeros".to_string(),
             format!(
-                "ensure that either time or distance cost is non-zero, \
+                "ensure that time, distance, or overtime cost is non-zero, \
                  vehicle type ids: '{}'",
                 type_ids.join(", ")
             ),

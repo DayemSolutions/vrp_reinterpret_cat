@@ -34,18 +34,20 @@ parameterized_test! {can_detect_zero_costs, (costs, expected), {
 }}
 
 can_detect_zero_costs! {
-    case01: ((0.0001, 0.0001), None),
-    case02: ((0., 0.0001), None),
-    case03: ((0.0001, 0.), None),
-    case04: ((0., 0.), Some("E1306".to_string())),
+    case01: ((0.0001, 0.0001, None), None),
+    case02: ((0., 0.0001, None), None),
+    case03: ((0.0001, 0., None), None),
+    case04: ((0., 0., None), Some("E1306".to_string())),
+    case05_overtime_only_is_a_cost: ((0., 0., Some(0.02)), None),
+    case06_zero_overtime_still_fails: ((0., 0., Some(0.)), Some("E1306".to_string())),
 }
 
-fn can_detect_zero_costs_impl(costs: (Float, Float), expected: Option<String>) {
-    let (distance, time) = costs;
+fn can_detect_zero_costs_impl(costs: (Float, Float, Option<Float>), expected: Option<String>) {
+    let (distance, time, overtime) = costs;
     let problem = Problem {
         fleet: Fleet {
             vehicles: vec![VehicleType {
-                costs: VehicleCosts { fixed: None, distance, time, span: None },
+                costs: VehicleCosts { fixed: None, distance, time, overtime, span: None },
                 ..create_default_vehicle_type()
             }],
             ..create_default_fleet()

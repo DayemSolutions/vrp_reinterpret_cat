@@ -148,6 +148,14 @@ pub(super) fn read_fleet(api_problem: &ApiProblem, props: &ProblemProperties, co
                     .set_shift_index(shift_index)
                     .set_vehicle_id(vehicle_id.to_string());
 
+                if let Some(overtime) = vehicle.costs.overtime {
+                    dimens.set_overtime_rate(overtime);
+                }
+
+                if let Some(regular_duration) = shift.regular_duration {
+                    dimens.set_regular_duration(regular_duration);
+                }
+
                 if let Some(driver_id) = vehicle.driver_id.as_ref() {
                     dimens.set_driver_id(driver_id.clone());
                 }

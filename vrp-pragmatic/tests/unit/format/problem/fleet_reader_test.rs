@@ -4,8 +4,8 @@ use crate::format_time;
 use crate::helpers::*;
 use std::sync::Arc;
 use vrp_core::models::common::{Distance, Profile as CoreProfile, TimeWindow, Timestamp};
-use vrp_core::models::problem::{DriverIdDimension, TravelTime};
 use vrp_core::models::problem::{Actor, ActorDetail, Vehicle};
+use vrp_core::models::problem::{DriverIdDimension, OvertimeRateDimension, RegularDurationDimension, TravelTime};
 use vrp_core::models::solution::Route;
 
 fn matrix(profile: Option<&str>, timestamp: Option<Float>, fill_value: i64, size: usize) -> Matrix {
@@ -196,4 +196,45 @@ fn reads_driver_id_into_dimens() {
 
     let vehicle = problem.fleet.vehicles.first().unwrap();
     assert_eq!(vehicle.dimens.get_driver_id(), Some(&"drv-1".to_string()));
+}
+
+#[test]
+fn reads_overtime_rate_and_regular_duration_into_dimens() {
+    let matrix = matrix(Some("car"), None, 1, 4);
+
+    let vehicle = VehicleType {
+        costs: VehicleCosts { overtime: Some(0.02), ..create_default_vehicle_costs() },
+        shifts: vec![
+            VehicleShift {
+                start: ShiftStart { earliest: format_time(0.), latest: None, location: (0., 0.).to_loc() },
+                end: Some(ShiftEnd { earliest: None, latest: format_time(99.), location: (0., 0.).to_loc() }),
+                regular_duration: Some(28800.0),
+                ..create_default_vehicle_shift()
+            },
+            VehicleShift {
+                start: ShiftStart { earliest: format_time(100.), latest: None, location: (0., 0.).to_loc() },
+                end: Some(ShiftEnd { earliest: None, latest: format_time(200.), location: (0., 0.).to_loc() }),
+                regular_duration: Some(21600.0),
+                ..create_default_vehicle_shift()
+            },
+        ],
+        ..create_default_vehicle_type()
+    };
+
+    let problem = Problem {
+        plan: Plan { jobs: vec![create_delivery_job("job1", (1., 1.))], relations: None, clustering: None },
+        fleet: Fleet { vehicles: vec![vehicle], profiles: create_default_matrix_profiles(), resources: None },
+        objectives: None,
+    };
+
+    let problem = (problem, vec![matrix]).read_pragmatic().unwrap();
+
+    let vehicles = &problem.fleet.vehicles;
+    assert_eq!(vehicles.len(), 2);
+
+    assert_eq!(vehicles[0].dimens.get_overtime_rate(), Some(&0.02));
+    assert_eq!(vehicles[0].dimens.get_regular_duration(), Some(&28800.0));
+
+    assert_eq!(vehicles[1].dimens.get_overtime_rate(), Some(&0.02));
+    assert_eq!(vehicles[1].dimens.get_regular_duration(), Some(&21600.0));
 }

@@ -270,6 +270,11 @@ pub struct VehicleCosts {
     /// Cost per time unit.
     pub time: Float,
 
+    /// Cost per time unit above the shift's regular duration. Defaults to the
+    /// time cost when omitted, which prices an overtime hour like any other.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overtime: Option<Float>,
+
     /// Specifies which portion of the route to include in cost calculations.
     /// Defaults to depot-to-depot for full round trip costs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -350,6 +355,11 @@ pub struct VehicleShift {
     /// Time constraints for the first and last jobs in this shift.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_times: Option<JobTimeConstraints>,
+
+    /// The duration this shift is paid at the regular rate, in seconds. Time
+    /// beyond it is overtime. No overtime when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regular_duration: Option<Float>,
 }
 
 /// Specifies a place where vehicle can load or unload cargo.

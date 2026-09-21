@@ -43,6 +43,14 @@ pub struct JobTimeConstraints {
 
 custom_dimension!(pub JobTimeConstraints typeof JobTimeConstraints);
 
+// Cost per time unit above the vehicle type's regular duration, shared by every shift of that
+// type because the rate is a property of the type's costs, not of any one shift.
+custom_dimension!(pub OvertimeRate typeof Float);
+
+// The duration a specific shift is paid at the regular rate, in seconds. Set per shift, not per
+// vehicle type, because two shifts of the same type can run different lengths.
+custom_dimension!(pub RegularDuration typeof Float);
+
 /// Represents operating costs for driver and vehicle.
 #[derive(Clone, Debug)]
 pub struct Costs {

@@ -100,6 +100,7 @@ mod single {
                         }]),
                         recharges: None,
                         job_times: None,
+                        regular_duration: None,
                     }],
                     capacity: vec![5],
                     skills: None,

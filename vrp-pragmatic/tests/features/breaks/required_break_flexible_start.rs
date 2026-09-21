@@ -393,6 +393,7 @@ fn can_assign_offset_break_with_first_job_cost_span() {
                     fixed: Some(10.),
                     distance: 1.,
                     time: 1.,
+                    overtime: None,
                     span: Some(RouteCostSpan::FirstJobToLastJob),
                 },
                 shifts: vec![VehicleShift {
@@ -449,6 +450,7 @@ fn can_assign_offset_break_with_first_job_span_and_range_offset() {
                     fixed: Some(10.),
                     distance: 1.,
                     time: 1.,
+                    overtime: None,
                     span: Some(RouteCostSpan::FirstJobToLastJob),
                 },
                 shifts: vec![VehicleShift {
@@ -1039,6 +1041,7 @@ fn can_assign_break_with_first_job_span_flexible_departure_and_wide_offset() {
                     fixed: Some(10.),
                     distance: 1.,
                     time: 1.,
+                    overtime: None,
                     span: Some(RouteCostSpan::FirstJobToLastJob),
                 },
                 shifts: vec![VehicleShift {
@@ -1099,6 +1102,7 @@ fn can_assign_break_with_first_job_span_late_time_windows_and_wide_offset() {
                     fixed: Some(10.),
                     distance: 1.,
                     time: 1.,
+                    overtime: None,
                     span: Some(RouteCostSpan::FirstJobToLastJob),
                 },
                 shifts: vec![VehicleShift {
@@ -1577,6 +1581,7 @@ fn probe_wide_offset_with_first_job_anchor() {
                     fixed: Some(10.),
                     distance: 1.,
                     time: 1.,
+                    overtime: None,
                     span: Some(RouteCostSpan::FirstJobToLastJob),
                 },
                 shifts: vec![VehicleShift {
