@@ -76,3 +76,58 @@ fn can_split_a_tour_that_would_run_into_overtime() {
     );
     assert_eq!(without_overtime.statistic.cost, 426., "nothing may be added to a shift which states no overtime");
 }
+
+/// Two jobs 100 units out from the depot, on a shift paid from its first job to its last one.
+fn create_spanned_problem(regular_duration: Option<Float>, overtime: Option<Float>) -> Problem {
+    Problem {
+        plan: Plan {
+            jobs: vec![
+                create_delivery_job_with_duration("job1", (100., 0.), 50.),
+                create_delivery_job_with_duration("job2", (110., 0.), 50.),
+            ],
+            ..create_empty_plan()
+        },
+        fleet: Fleet {
+            vehicles: vec![VehicleType {
+                costs: VehicleCosts {
+                    overtime,
+                    span: Some(RouteCostSpan::FirstJobToLastJob),
+                    ..create_default_vehicle_costs()
+                },
+                shifts: vec![VehicleShift { regular_duration, ..create_default_vehicle_shift() }],
+                ..create_default_vehicle_type()
+            }],
+            ..create_default_fleet()
+        },
+        objectives: create_min_jobs_cost_objective(),
+    }
+}
+
+fn solve_spanned(regular_duration: Option<Float>, overtime: Option<Float>) -> crate::format::solution::Solution {
+    let problem = create_spanned_problem(regular_duration, overtime);
+    let matrix = create_matrix_from_problem(&problem);
+
+    solve_with_metaheuristic(problem, Some(vec![matrix]))
+}
+
+/// The tour drives 100 out, serves for 50, drives 10 on, serves for 50 and drives 110 home: 320
+/// seconds door to door, but 110 of them between the first job's arrival and the last one's
+/// departure, which is the stretch a `first-job-to-last-job` shift is paid for and the only one
+/// the objective ever sees.
+///
+/// Against a regular duration of 100 that is 10 seconds of overtime, so a rate of 5 against a
+/// regular 1 owes a premium of 40. Read off the round trip instead - the duration the tour
+/// statistic reports - the same shift would be charged for 220 seconds it is not paid for: a
+/// premium of 880 in a report whose solution was chosen against 40.
+#[test]
+fn can_price_overtime_on_the_span_the_shift_is_paid_for() {
+    let with_overtime = solve_spanned(Some(100.), Some(5.));
+    let without_overtime = solve_spanned(None, None);
+
+    assert!(with_overtime.unassigned.is_none(), "both jobs must be served: {:?}", with_overtime.unassigned);
+    assert_eq!(with_overtime.tours.len(), 1);
+    assert_eq!(with_overtime.statistic.duration, 320, "the tour itself is the round trip");
+
+    let premium = with_overtime.statistic.cost - without_overtime.statistic.cost;
+    assert_eq!(premium, 40., "only the paid span may be charged, not the depot legs outside it");
+}

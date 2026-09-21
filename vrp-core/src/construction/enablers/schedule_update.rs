@@ -224,16 +224,30 @@ fn update_states(route_ctx: &mut RouteContext, activity: &dyn ActivityCost, tran
     route_ctx.state_mut().set_waiting_time_states(waiting_times);
 }
 
-fn update_statistics(route_ctx: &mut RouteContext, transport: &dyn TransportCost) {
-    let (route, state) = route_ctx.as_mut();
-
-    let start = route.tour.start().unwrap();
-    let end = route.tour.end().unwrap();
-    let total_activities = route.tour.total();
+/// Returns the duration of the route measured over the span its shift is paid on.
+///
+/// This is the figure `update_statistics` stores as the tour's `TotalDuration` state, and the one
+/// anything which prices time has to ask for: a shift paid from its first job to its last one runs
+/// shorter than the round trip which carries it, and the depot legs it is not paid for must not be
+/// charged to it. Asking here rather than re-deriving the span is what keeps the cost the solver
+/// optimises and the cost the solution reports the same number.
+pub fn get_route_duration(route: &Route) -> Duration {
+    let (Some(start), Some(end)) = (route.tour.start(), route.tour.end()) else {
+        return Duration::default();
+    };
 
     let cost_span = route.actor.vehicle.dimens.get_route_cost_span().copied().unwrap_or_default();
 
-    let total_dur = calculate_route_duration(route, cost_span, total_activities, start, end);
+    calculate_route_duration(route, cost_span, route.tour.total(), start, end)
+}
+
+fn update_statistics(route_ctx: &mut RouteContext, transport: &dyn TransportCost) {
+    let (route, state) = route_ctx.as_mut();
+
+    let total_activities = route.tour.total();
+    let cost_span = route.actor.vehicle.dimens.get_route_cost_span().copied().unwrap_or_default();
+
+    let total_dur = get_route_duration(route);
     let total_dist = calculate_route_distance(route, transport, cost_span, total_activities);
 
     state.set_total_distance(total_dist);
