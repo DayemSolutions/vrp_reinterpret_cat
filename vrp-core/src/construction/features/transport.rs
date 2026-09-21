@@ -380,9 +380,16 @@ where
 /// What a tour owes above its regular duration: the difference between the overtime rate and the
 /// regular one, charged on the time beyond the threshold.
 ///
-/// The plain time cost already charged that time once at the regular rate, so only the difference
-/// on top of it is owed here. A shift which states no regular duration owes nothing, and a rate
-/// below the regular one clamps to zero rather than paying the solver to run late.
+/// The plain time cost already charged that time once, so only the difference on top of it is owed
+/// here. A shift which states no regular duration owes nothing, and a rate below the regular one
+/// clamps to zero rather than paying the solver to run late.
+///
+/// NOTE the rate subtracted is the vehicle's `per_driving_time`, while what the tour was actually
+/// charged for that second is `max(per_driving, per_service, per_waiting)` for the vehicle plus the
+/// same again for the driver. Those agree for every problem the pragmatic reader builds - it sets
+/// all three vehicle rates from `costs.time` and leaves the driver's at zero - and only for those.
+/// A fleet assembled through the core API with rates which differ, or with a paid driver, has its
+/// premium measured against a regular rate it does not pay.
 pub fn get_overtime_premium(actor: &Actor, duration: Duration) -> Cost {
     let dimens = &actor.vehicle.dimens;
 
@@ -403,9 +410,16 @@ pub fn get_overtime_premium(actor: &Actor, duration: Duration) -> Cost {
 /// outside of. The exact figure is `fitness`'s job; the estimate only has to rank candidates, and a
 /// premium which appears one insertion late would let construction fill into overtime blind.
 fn get_overtime_premium_delta(route_ctx: &RouteContext, change_duration: Duration) -> Cost {
+    let actor = route_ctx.route().actor.as_ref();
+
+    // this runs for every candidate position, and most problems state no regular duration on any
+    // shift, so the miss is answered on one dimension lookup and before any state is read.
+    if actor.vehicle.dimens.get_regular_duration().is_none() {
+        return Cost::default();
+    }
+
     let old_duration = route_ctx.state().get_total_duration().copied().unwrap_or(0.);
     let new_duration = old_duration + change_duration;
-    let actor = route_ctx.route().actor.as_ref();
 
     get_overtime_premium(actor, new_duration) - get_overtime_premium(actor, old_duration)
 }

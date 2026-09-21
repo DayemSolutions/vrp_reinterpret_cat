@@ -244,6 +244,12 @@ pub fn get_route_duration(route: &Route) -> Duration {
 fn update_statistics(route_ctx: &mut RouteContext, transport: &dyn TransportCost) {
     let (route, state) = route_ctx.as_mut();
 
+    // `get_route_duration` is total because the writer must be able to ask it about any route. Here
+    // it is not: a route being scheduled without a start and an end is a bug, and one which would
+    // otherwise surface as a tour whose duration is quietly zero.
+    debug_assert!(route.tour.start().is_some(), "{OP_START_MSG}");
+    debug_assert!(route.tour.end().is_some(), "route being scheduled has no end activity");
+
     let total_activities = route.tour.total();
     let cost_span = route.actor.vehicle.dimens.get_route_cost_span().copied().unwrap_or_default();
 

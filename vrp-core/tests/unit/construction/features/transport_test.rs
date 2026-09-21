@@ -302,8 +302,10 @@ mod overtime {
 
     /// The point beyond which the shift is no longer paid at the regular rate.
     const REGULAR_DURATION: Duration = 3600.;
-    /// Three times what `DEFAULT_VEHICLE_COSTS` pays for a regular second, which leaves a premium
-    /// of two on top of the time cost the second is already charged at.
+    /// Three times the vehicle's `per_driving_time`, which is what the premium is measured against
+    /// and is 1 in `DEFAULT_VEHICLE_COSTS` - so the premium is 2. The tour is charged more than that
+    /// per second: this fleet's `test_driver()` carries the same rates as the vehicle, so a regular
+    /// second costs 2, once on each. The premium does not net that second rate off, by design.
     const OVERTIME_RATE: Cost = 3.;
     const PREMIUM: Cost = OVERTIME_RATE - DEFAULT_VEHICLE_COSTS.per_driving_time;
 
