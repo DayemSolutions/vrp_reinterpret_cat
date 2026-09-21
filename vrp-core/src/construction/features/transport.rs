@@ -377,6 +377,39 @@ where
     prev_target_next - prev_next
 }
 
+/// What a tour owes above its regular duration: the difference between the overtime rate and the
+/// regular one, charged on the time beyond the threshold.
+///
+/// The plain time cost already charged that time once at the regular rate, so only the difference
+/// on top of it is owed here. A shift which states no regular duration owes nothing, and a rate
+/// below the regular one clamps to zero rather than paying the solver to run late.
+pub fn get_overtime_premium(actor: &Actor, duration: Duration) -> Cost {
+    let dimens = &actor.vehicle.dimens;
+
+    let Some(regular) = dimens.get_regular_duration().copied() else {
+        return Cost::default();
+    };
+
+    let premium = (dimens.get_overtime_rate().copied().unwrap_or(0.) - actor.vehicle.costs.per_driving_time).max(0.);
+
+    premium * (duration - regular).max(0.)
+}
+
+/// What an insertion which grows the tour by `change_duration` adds to the premium it already owes.
+///
+/// NOTE the new duration is projected as the tour's total plus the change, the same cheap
+/// projection `tour_limits` uses in its simplest branch: it ignores a departure move the insertion
+/// might cause, and a tour whose duration is measured over a `RouteCostSpan` the change falls
+/// outside of. The exact figure is `fitness`'s job; the estimate only has to rank candidates, and a
+/// premium which appears one insertion late would let construction fill into overtime blind.
+fn get_overtime_premium_delta(route_ctx: &RouteContext, change_duration: Duration) -> Cost {
+    let old_duration = route_ctx.state().get_total_duration().copied().unwrap_or(0.);
+    let new_duration = old_duration + change_duration;
+    let actor = route_ctx.route().actor.as_ref();
+
+    get_overtime_premium(actor, new_duration) - get_overtime_premium(actor, old_duration)
+}
+
 struct CostObjective {
     activity: Arc<dyn ActivityCost>,
     transport: Arc<dyn TransportCost>,
@@ -407,13 +440,17 @@ impl CostObjective {
 
         let new_costs = tp_cost_left + tp_cost_right + act_cost_left + act_cost_right;
 
-        // no jobs yet or open vrp.
+        // where the tour's tail ends up with the target in it: `next` pushed along by it, or the
+        // target itself once it lands at the end.
+        let dep_time_tail = if next.is_some() { dep_time_right } else { dep_time_left };
+
+        // no jobs yet or open vrp: nothing is displaced, so the whole new leg is what the tour grows by.
         if !route_ctx.route().tour.has_jobs() {
-            return new_costs;
+            return new_costs + get_overtime_premium_delta(route_ctx, dep_time_tail - prev.schedule.departure);
         }
 
         let Some(next) = next else {
-            return new_costs;
+            return new_costs + get_overtime_premium_delta(route_ctx, dep_time_tail - prev.schedule.departure);
         };
 
         let waiting_time = route_ctx.state().get_waiting_time_at(activity_ctx.index + 1).copied().unwrap_or_default();
@@ -426,7 +463,7 @@ impl CostObjective {
 
         let old_costs = tp_cost_old + act_cost_old + waiting_cost;
 
-        new_costs - old_costs
+        new_costs - old_costs + get_overtime_premium_delta(route_ctx, dep_time_tail - dep_time_old)
     }
 
     fn analyze_route_leg(
@@ -452,7 +489,13 @@ impl CostObjective {
 
 impl FeatureObjective for CostObjective {
     fn fitness(&self, insertion_ctx: &InsertionContext) -> Cost {
-        insertion_ctx.get_total_cost().unwrap_or_default()
+        let base = insertion_ctx.get_total_cost().unwrap_or_default();
+
+        insertion_ctx.solution.routes.iter().fold(base, |acc, route_ctx| {
+            let duration = route_ctx.state().get_total_duration().copied().unwrap_or(0.);
+
+            acc + get_overtime_premium(route_ctx.route().actor.as_ref(), duration)
+        })
     }
 
     fn estimate(&self, move_ctx: &MoveContext<'_>) -> Cost {

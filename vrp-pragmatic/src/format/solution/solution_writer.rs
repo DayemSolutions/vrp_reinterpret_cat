@@ -7,7 +7,7 @@ use crate::format::solution::activity_matcher::get_job_tag;
 use crate::format::solution::model::Timing;
 use crate::format::solution::*;
 use vrp_core::construction::enablers::{ReservedTimesIndex, get_route_intervals};
-use vrp_core::construction::features::JobDemandDimension;
+use vrp_core::construction::features::{JobDemandDimension, get_overtime_premium};
 use vrp_core::construction::heuristics::UnassignmentInfo;
 use vrp_core::models::common::*;
 use vrp_core::models::problem::{JobIdDimension, JobTimeConstraintsDimension, Multi, TravelTime, VehicleIdDimension};
@@ -284,7 +284,9 @@ fn create_tour(
         leg
     });
 
-    leg.statistic.cost += vehicle.costs.fixed;
+    // the premium the search priced on this tour's own duration: without it the reported cost would
+    // not be the cost the solution was chosen by.
+    leg.statistic.cost += vehicle.costs.fixed + get_overtime_premium(actor, leg.statistic.duration as Float);
     tour.statistic = leg.statistic;
 
     insert_reserved_times_as_breaks(route, &mut tour, reserved_times_index);

@@ -293,3 +293,119 @@ mod timing {
         assert_eq!(result, ConstraintViolation::fail(VIOLATION_CODE));
     }
 }
+
+mod overtime {
+    use super::*;
+    use crate::construction::enablers::{TotalDistanceTourState, TotalDurationTourState};
+    use crate::helpers::construction::heuristics::TestInsertionContextBuilder;
+    use crate::models::problem::{OvertimeRateDimension, RegularDurationDimension, Vehicle};
+
+    /// The point beyond which the shift is no longer paid at the regular rate.
+    const REGULAR_DURATION: Duration = 3600.;
+    /// Three times what `DEFAULT_VEHICLE_COSTS` pays for a regular second, which leaves a premium
+    /// of two on top of the time cost the second is already charged at.
+    const OVERTIME_RATE: Cost = 3.;
+    const PREMIUM: Cost = OVERTIME_RATE - DEFAULT_VEHICLE_COSTS.per_driving_time;
+
+    fn create_feature() -> Feature {
+        TransportFeatureBuilder::new("transport")
+            .set_violation_code(VIOLATION_CODE)
+            .set_transport_cost(TestTransportCost::new_shared())
+            .set_activity_cost(TestActivityCost::new_shared())
+            .build_minimize_cost()
+            .unwrap()
+    }
+
+    /// A vehicle whose shift states its regular duration and overtime rate, or neither of them.
+    fn create_vehicle(overtime_rate: Option<Cost>) -> Vehicle {
+        let mut vehicle_builder = TestVehicleBuilder::default();
+        vehicle_builder.id("v1");
+
+        if let Some(overtime_rate) = overtime_rate {
+            vehicle_builder.dimens_mut().set_overtime_rate(overtime_rate).set_regular_duration(REGULAR_DURATION);
+        }
+
+        vehicle_builder.build()
+    }
+
+    fn create_fleet(overtime_rate: Option<Cost>) -> Fleet {
+        FleetBuilder::default().add_driver(test_driver()).add_vehicle(create_vehicle(overtime_rate)).build()
+    }
+
+    fn get_fitness(overtime_rate: Option<Cost>, total_duration: Duration) -> Cost {
+        let fleet = create_fleet(overtime_rate);
+        let mut state = RouteState::default();
+        state.set_total_distance(100.);
+        state.set_total_duration(total_duration);
+        let route_ctx = RouteContextBuilder::default()
+            .with_route(RouteBuilder::default().with_vehicle(&fleet, "v1").build())
+            .with_state(state)
+            .build();
+        let insertion_ctx = TestInsertionContextBuilder::default().with_routes(vec![route_ctx]).build();
+
+        create_feature().objective.unwrap().fitness(&insertion_ctx)
+    }
+
+    parameterized_test! {can_price_overtime_in_fitness, (total_duration, overtime_rate, expected), {
+        can_price_overtime_in_fitness_impl(total_duration, overtime_rate, expected);
+    }}
+
+    can_price_overtime_in_fitness! {
+        case01_above_the_threshold: (5400., OVERTIME_RATE, PREMIUM * 1800.),
+        case02_at_the_threshold: (REGULAR_DURATION, OVERTIME_RATE, 0.),
+        case03_below_the_threshold: (3000., OVERTIME_RATE, 0.),
+        case04_cheaper_than_the_regular_rate: (5400., 0.5, 0.),
+    }
+
+    fn can_price_overtime_in_fitness_impl(total_duration: Duration, overtime_rate: Cost, expected: Cost) {
+        let with_overtime = get_fitness(Some(overtime_rate), total_duration);
+        let without_overtime = get_fitness(None, total_duration);
+
+        assert_eq!(with_overtime - without_overtime, expected);
+    }
+
+    /// Estimates the same insertion twice: the target sits 100 units out from a tour which never
+    /// leaves its depot, so it adds 100 there and 100 back - 200 seconds - to whatever the tour
+    /// already runs.
+    fn get_estimate(overtime_rate: Option<Cost>, total_duration: Duration) -> Cost {
+        let fleet = create_fleet(overtime_rate);
+        let solution_ctx = TestInsertionContextBuilder::default().build().solution;
+        let mut state = RouteState::default();
+        state.set_total_duration(total_duration);
+        let route_ctx = RouteContextBuilder::default()
+            .with_route(
+                RouteBuilder::default()
+                    .with_vehicle(&fleet, "v1")
+                    .add_activity(ActivityBuilder::with_location(0).build())
+                    .build(),
+            )
+            .with_state(state)
+            .build();
+        let target = ActivityBuilder::with_location(100).build();
+        let activity_ctx = ActivityContext {
+            index: 1,
+            prev: route_ctx.route().tour.get(1).unwrap(),
+            target: &target,
+            next: route_ctx.route().tour.get(2),
+        };
+
+        create_feature().objective.unwrap().estimate(&MoveContext::activity(&solution_ctx, &route_ctx, &activity_ctx))
+    }
+
+    parameterized_test! {can_price_overtime_in_estimate, (total_duration, expected), {
+        can_price_overtime_in_estimate_impl(total_duration, expected);
+    }}
+
+    can_price_overtime_in_estimate! {
+        case01_pushed_over_the_threshold: (3500., PREMIUM * 100.),
+        case02_kept_under_the_threshold: (3000., 0.),
+        case03_already_over_the_threshold: (4000., PREMIUM * 200.),
+    }
+
+    fn can_price_overtime_in_estimate_impl(total_duration: Duration, expected: Cost) {
+        let with_overtime = get_estimate(Some(OVERTIME_RATE), total_duration);
+        let without_overtime = get_estimate(None, total_duration);
+
+        assert_eq!(with_overtime - without_overtime, expected);
+    }
+}
