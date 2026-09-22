@@ -15,7 +15,7 @@ mod territory_test;
 
 use super::vehicle_distance::get_job_location;
 use super::*;
-use crate::construction::enablers::{TotalDistanceTourState, TotalDurationTourState};
+use crate::construction::enablers::{PaidWorkingDurationTourState, TotalDistanceTourState};
 use crate::models::problem::{JobIdDimension, driver_key};
 use std::collections::HashMap;
 
@@ -750,7 +750,7 @@ impl TerritoryShared {
             .filter_map(|job| {
                 let id = job.dimens().get_job_id()?.clone();
                 let loc = get_job_location(job)?;
-                let best = self
+                let travel = self
                     .actors
                     .iter()
                     .filter(|actor| (self.compatibility_fn)(job, actor))
@@ -758,9 +758,32 @@ impl TerritoryShared {
                     .map(|start| self.travel(start, loc) + self.travel(loc, start))
                     .min_by(|a, b| a.total_cmp(b))
                     .unwrap_or(0.0);
-                Some((id, best))
+                Some((id, travel + self.service_share(job)))
             })
             .collect()
+    }
+
+    /// What the job itself adds to the balance quantity, beside the travel to reach it.
+    ///
+    /// ⚠️ For `Duration` that is its SERVICE time, and leaving it out is not a rounding error:
+    /// the route load is the paid span, which is service plus idle plus the drive between jobs,
+    /// and on a field-service day service dominates. An estimate made of travel alone would
+    /// price a two-hour visit next door as cheaper than a ten-minute visit across town, and
+    /// `.ai/rules/solver.md` is explicit that an estimate disagreeing with its fitness in
+    /// QUANTITY is mis-scaled against everything sharing its layer.
+    ///
+    /// For `Distance` it is zero: standing still drives no miles.
+    fn service_share(&self, job: &Job) -> Float {
+        if !matches!(self.balance, Some(TerritoryBalance::Duration)) {
+            return 0.0;
+        }
+
+        match job {
+            Job::Single(single) => single.places.first().map(|place| place.duration).unwrap_or(0.0),
+            Job::Multi(multi) => {
+                multi.jobs.iter().filter_map(|s| s.places.first().map(|place| place.duration)).sum()
+            }
+        }
     }
 
     /// Travel between two locations in the BALANCE metric's unit.
@@ -867,7 +890,9 @@ impl TerritoryShared {
                 route_ctx.route().tour.jobs().map(|j| self.job_metric(j)).sum()
             }
             Some(TerritoryBalance::Distance) => route_ctx.state().get_total_distance().copied().unwrap_or(0.0),
-            Some(TerritoryBalance::Duration) => route_ctx.state().get_total_duration().copied().unwrap_or(0.0),
+            Some(TerritoryBalance::Duration) => {
+                route_ctx.state().get_paid_working_duration().copied().unwrap_or(0.0)
+            }
         }
     }
 
