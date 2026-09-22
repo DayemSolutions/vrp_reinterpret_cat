@@ -295,6 +295,8 @@ fn territory_with_anchors(anchors: std::collections::HashMap<String, Vec<usize>>
         weights: None,
         allow_idle_drivers: false,
         quota: None,
+        shares: None,
+        pools: None,
     }
 }
 

@@ -24,8 +24,6 @@ struct TerritoryFixture {
     problem: Problem,
     home_vehicle: HashMap<String, String>,
     job_value: HashMap<String, Float>,
-    job_location: HashMap<String, (f64, f64)>,
-    anchor_locations: Vec<(f64, f64)>,
     vehicle_ids: Vec<String>,
 }
 
@@ -79,6 +77,8 @@ fn territory_objective_with_quota_and_weights(
         weights,
         allow_idle_drivers: false,
         quota,
+        shares: None,
+        pools: None,
     }
 }
 
@@ -108,7 +108,6 @@ fn problem_two_drivers_shared_start(metric: BalancePeriodMetric) -> TerritoryFix
 
     let mut home_vehicle = HashMap::new();
     let mut job_value = HashMap::new();
-    let mut job_location = HashMap::new();
     let mut jobs = Vec::new();
     let mut vehicles = Vec::new();
     let mut vehicle_ids = Vec::new();
@@ -128,7 +127,6 @@ fn problem_two_drivers_shared_start(metric: BalancePeriodMetric) -> TerritoryFix
             let loc = (anchor.0 + dx, anchor.1 + dy);
             home_vehicle.insert(job_id.clone(), vehicle_id.clone());
             job_value.insert(job_id.clone(), value);
-            job_location.insert(job_id.clone(), loc);
             jobs.push(create_delivery_job_with_production_value(&job_id, loc, value));
         }
     }
@@ -150,8 +148,6 @@ fn problem_two_drivers_shared_start(metric: BalancePeriodMetric) -> TerritoryFix
         problem: Problem { plan, fleet, objectives },
         home_vehicle,
         job_value,
-        job_location,
-        anchor_locations: anchor_coords.to_vec(),
         vehicle_ids,
     }
 }
@@ -177,7 +173,6 @@ fn problem_grid(cluster_sizes: &[usize], metric: BalancePeriodMetric) -> Territo
 
     let mut home_vehicle = HashMap::new();
     let mut job_value = HashMap::new();
-    let mut job_location = HashMap::new();
     let mut jobs = Vec::new();
     let mut vehicles = Vec::new();
     let mut vehicle_ids = Vec::new();
@@ -207,7 +202,6 @@ fn problem_grid(cluster_sizes: &[usize], metric: BalancePeriodMetric) -> Territo
             let loc = (anchor.0 + dx, anchor.1 + dy);
             home_vehicle.insert(job_id.clone(), vehicle_id.clone());
             job_value.insert(job_id.clone(), 1.);
-            job_location.insert(job_id.clone(), loc);
             jobs.push(create_delivery_job_with_production_value(&job_id, loc, 1.));
         }
     }
@@ -229,8 +223,6 @@ fn problem_grid(cluster_sizes: &[usize], metric: BalancePeriodMetric) -> Territo
         problem: Problem { plan, fleet, objectives },
         home_vehicle,
         job_value,
-        job_location,
-        anchor_locations: anchor_coords,
         vehicle_ids,
     }
 }
@@ -330,19 +322,6 @@ fn activity_counts_per_tour(solution: &Solution, vehicle_ids: &[String]) -> Vec<
         .collect()
 }
 
-/// Proximity from a job location to the nearest of `anchor_locations`, computed the same way
-/// `create_matrix_from_problem` builds the routing matrix (squared-coordinate-difference Euclidean
-/// distance, rounded to the matrix's integer resolution). This mirrors
-/// `TerritoryShared::nearest_anchor_prox` in `vrp-core/src/construction/features/territory.rs`
-/// against the *full* anchor set (not just the serving vehicle's own anchor) -- which is exactly
-/// what `job_metric`'s `Distance`/`Duration` branch bills per job, independent of which vehicle
-/// ends up serving it.
-fn nearest_anchor_prox(job_loc: (f64, f64), anchor_locations: &[(f64, f64)]) -> Float {
-    anchor_locations
-        .iter()
-        .map(|&(ax, ay)| ((job_loc.0 - ax).powf(2.) + (job_loc.1 - ay).powf(2.)).sqrt().round())
-        .fold(Float::INFINITY, |a, b| a.min(b))
-}
 
 /// Per-tour totals of `metric`, indexed against the full vehicle roster like
 /// `activity_counts_per_tour`. `Distance`/`Duration` read the tour's OWN travel, because that is

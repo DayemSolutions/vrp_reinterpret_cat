@@ -137,6 +137,8 @@ fn can_deserialize_territory_objective_with_anchors() {
             weights,
             allow_idle_drivers,
             quota,
+            shares: None,
+            pools: None,
         } => {
             assert_eq!(anchors.get("drv-1"), Some(&vec![4]));
             assert_eq!(anchors.get("drv-2"), Some(&vec![9, 11]));
@@ -177,6 +179,8 @@ fn can_deserialize_the_full_territory_objective_payload() {
             weights: Some(weights),
             allow_idle_drivers,
             quota: Some(quota),
+            shares: None,
+            pools: None,
         } => {
             assert_eq!(balance_tolerance, 0.05);
             assert!(allow_idle_drivers);
@@ -217,6 +221,8 @@ fn territory_objective_omits_absent_weights_when_serialized() {
         weights: None,
         allow_idle_drivers: false,
         quota: None,
+        shares: None,
+        pools: None,
     };
 
     let json = serde_json::to_string(&objective).unwrap();
@@ -265,6 +271,8 @@ fn territory_objective_omits_an_absent_quota_when_serialized() {
         weights: None,
         allow_idle_drivers: false,
         quota: None,
+        shares: None,
+        pools: None,
     };
 
     let json = serde_json::to_string(&objective).unwrap();

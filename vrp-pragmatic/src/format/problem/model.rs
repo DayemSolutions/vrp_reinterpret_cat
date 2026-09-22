@@ -762,6 +762,27 @@ pub enum Objective {
         /// forms the field serializer emits would otherwise be dropped).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quota: Option<std::collections::HashMap<String, Float>>,
+        /// Per-driver quota SHARES, keyed by the same driver identity as `quota`: the fraction of
+        /// its pool's load that driver is expected to carry, summing to 1.0 within a pool.
+        ///
+        /// This is how `distance` and `duration` get a quota at all. Those two are properties of a
+        /// ROUTE — travel depends on the order the stops are visited — so the problem holds no
+        /// total to split ahead of the solve: the caller sends the ratio it knows (capacity, and
+        /// which work each driver may reach) and the solver reads the level off the current
+        /// solution. Present ⇒ `quota` is ignored.
+        ///
+        /// Single-word key, so its snake_case and camelCase spellings coincide and no `alias` is
+        /// needed — same reasoning as `quota` and `weights`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shares: Option<std::collections::HashMap<String, Float>>,
+        /// The pool each `shares` entry is measured inside: the drivers competing for the same
+        /// work. This is what keeps a share gate-aware — a driver a service area holds off half the
+        /// ground must be quoted against the half it can reach, or its deficit never closes.
+        ///
+        /// A driver absent from this map falls into one shared default pool, which is the whole
+        /// fleet when no hard gate splits it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pools: Option<std::collections::HashMap<String, String>>,
         /// When true, drivers left with no jobs are excluded from the balance (their quota is
         /// re-based over the used drivers), so leaving a driver idle is not an imbalance. Defaults
         /// to false (balance spans every driver).

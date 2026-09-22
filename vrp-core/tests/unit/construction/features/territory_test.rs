@@ -1,4 +1,6 @@
-use crate::construction::features::territory::{TerritoryFitnessSolutionState, TerritoryShared};
+use crate::construction::features::territory::{
+    TerritoryFitnessSolutionState, TerritoryRouteQuotaTourState, TerritoryShared,
+};
 use crate::construction::features::{
     TerritoryBalance, TerritoryFeatureBuilder, TerritoryFitnessData, TerritoryProximity,
 };
@@ -749,6 +751,8 @@ fn push_marginal_fires_when_one_shift_of_several_is_over_its_share() {
         anchors.clone(),
         HashMap::new(),
         HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
         Arc::new(|_: &Job| 1.0),
         false,
     );
@@ -1006,6 +1010,18 @@ fn shared_over(
     balance: Option<TerritoryBalance>,
     supplied_quotas: HashMap<String, Float>,
 ) -> SharedFixture {
+    shared_over_with_shares(drivers, job_locations, balance, supplied_quotas, HashMap::new(), HashMap::new())
+}
+
+/// [`shared_over`] with caller-supplied quota shares and pools — the route-level quota mode.
+fn shared_over_with_shares(
+    drivers: &[(&str, usize, Float)],
+    job_locations: &[usize],
+    balance: Option<TerritoryBalance>,
+    supplied_quotas: HashMap<String, Float>,
+    supplied_shares: HashMap<String, Float>,
+    quota_pools: HashMap<String, String>,
+) -> SharedFixture {
     let mut fleet_builder = FleetBuilder::default();
     fleet_builder.add_driver(test_driver());
     for (key, _, end) in drivers {
@@ -1047,6 +1063,8 @@ fn shared_over(
         anchors,
         HashMap::new(),
         supplied_quotas,
+        supplied_shares,
+        quota_pools,
         Arc::new(|_: &Job| 1.0),
         false,
     );
@@ -1195,4 +1213,137 @@ fn job_metric_for_travel_targets_is_the_ideal_round_trip() {
     let job = Job::Single(fixture.singles[0].clone());
 
     assert_eq!(fixture.shared.job_metric(&job), 10.0, "the estimate must be the round trip, not the anchor hop");
+}
+
+/// Shares carry the ratio, the solution carries the level, and a pool is what keeps one driver's
+/// quota from being inflated by ground it may never reach.
+#[test]
+fn supplied_shares_take_their_level_from_their_own_pool() {
+    let drivers = [("d1", 0, 1000.0), ("d2", 0, 1000.0), ("d3", 50, 1000.0)];
+    let shares = HashMap::from([("d1".to_string(), 0.5), ("d2".to_string(), 0.5), ("d3".to_string(), 1.0)]);
+    let pools = HashMap::from([
+        ("d1".to_string(), "a".to_string()),
+        ("d2".to_string(), "a".to_string()),
+        ("d3".to_string(), "b".to_string()),
+    ]);
+    let fixture = shared_over_with_shares(
+        &drivers,
+        &[5, 95],
+        Some(TerritoryBalance::Duration),
+        HashMap::new(),
+        shares,
+        pools,
+    );
+
+    let loads = HashMap::from([("d1".to_string(), 80.0), ("d2".to_string(), 20.0), ("d3".to_string(), 40.0)]);
+    let quotas = fixture.shared.effective_quotas(&loads);
+
+    // Pool "a" holds 100 between two equal shares: 50 each, so d1 is over and d2 is under.
+    assert_eq!(quotas.get("d1").copied(), Some(50.0));
+    assert_eq!(quotas.get("d2").copied(), Some(50.0));
+    // Pool "b" holds 40 and d3 owes all of it — untouched by pool "a"'s 100.
+    assert_eq!(quotas.get("d3").copied(), Some(40.0));
+    // The quotas of a pool sum to that pool's own total, which is what leaves a deficit facing
+    // every surplus.
+    assert_eq!(quotas["d1"] + quotas["d2"], loads["d1"] + loads["d2"]);
+}
+
+/// A driver the caller left out of the pool map still balances — against everyone else who was
+/// left out. One default pool is the right answer when no hard gate splits the fleet.
+#[test]
+fn drivers_without_a_pool_share_one_default_pool() {
+    let drivers = [("d1", 0, 1000.0), ("d2", 0, 1000.0)];
+    let shares = HashMap::from([("d1".to_string(), 0.25), ("d2".to_string(), 0.75)]);
+    let fixture = shared_over_with_shares(
+        &drivers,
+        &[5, 95],
+        Some(TerritoryBalance::Distance),
+        HashMap::new(),
+        shares,
+        HashMap::new(),
+    );
+
+    let loads = HashMap::from([("d1".to_string(), 60.0), ("d2".to_string(), 40.0)]);
+    let quotas = fixture.shared.effective_quotas(&loads);
+
+    assert_eq!(quotas.get("d1").copied(), Some(25.0));
+    assert_eq!(quotas.get("d2").copied(), Some(75.0));
+}
+
+/// Shares outrank a supplied amount: a caller that sends both means the ratio it knows and a level
+/// it could not.
+#[test]
+fn supplied_shares_replace_a_supplied_quota() {
+    let drivers = [("d1", 0, 1000.0), ("d2", 0, 1000.0)];
+    let fixture = shared_over_with_shares(
+        &drivers,
+        &[5, 95],
+        Some(TerritoryBalance::Duration),
+        HashMap::from([("d1".to_string(), 999.0), ("d2".to_string(), 999.0)]),
+        HashMap::from([("d1".to_string(), 0.5), ("d2".to_string(), 0.5)]),
+        HashMap::new(),
+    );
+
+    let loads = HashMap::from([("d1".to_string(), 30.0), ("d2".to_string(), 10.0)]);
+    let quotas = fixture.shared.effective_quotas(&loads);
+
+    assert_eq!(quotas.get("d1").copied(), Some(20.0), "the share's level wins over the supplied amount");
+    assert_eq!(quotas.get("d2").copied(), Some(20.0));
+}
+
+/// `push_marginal` runs during insertion with only a route in hand, so the route's slice of its
+/// driver's quota is cached by the solution-state pass. Under shares that cache is the ONLY place
+/// the quota exists at all — its level is a property of a solution.
+#[test]
+fn the_solution_state_caches_each_route_s_slice_of_the_quota() {
+    let vehicle_d0 = build_vehicle("v_d0", "d0");
+    let vehicle_d1 = build_vehicle("v_d1", "d1");
+    let fleet =
+        FleetBuilder::default().add_driver(test_driver()).add_vehicle(vehicle_d0).add_vehicle(vehicle_d1).build();
+    let actor_d0 = get_test_actor_from_fleet(&fleet, "v_d0");
+    let actor_d1 = get_test_actor_from_fleet(&fleet, "v_d1");
+
+    let job_near = TestSingleBuilder::default().id("job_near").location(Some(5)).build_shared();
+    let job_far = TestSingleBuilder::default().id("job_far").location(Some(95)).build_shared();
+    let transport = TestTransportCost::new_shared();
+    let jobs = Arc::new(
+        Jobs::new(
+            &fleet,
+            vec![Job::Single(job_near.clone()), Job::Single(job_far.clone())],
+            transport.as_ref(),
+            &test_logger(),
+        )
+        .unwrap(),
+    );
+
+    let feature = TerritoryFeatureBuilder::new("territory")
+        .set_transport(transport)
+        .set_actors(vec![actor_d0.clone(), actor_d1.clone()])
+        .set_jobs(jobs)
+        .set_compatibility_fn(|_, _| true)
+        .set_proximity(TerritoryProximity::Distance)
+        .set_balance(Some(TerritoryBalance::Duration))
+        .set_anchors(HashMap::from([("d0".to_string(), vec![0usize]), ("d1".to_string(), vec![100usize])]))
+        .set_quota_shares(HashMap::from([("d0".to_string(), 0.5), ("d1".to_string(), 0.5)]))
+        .build()
+        .unwrap();
+
+    // d0 carries both jobs, d1 none: the pool's whole load sits on one driver.
+    let mut ctx = TestInsertionContextBuilder::default()
+        .with_routes(vec![
+            route_with_jobs(actor_d0, vec![(job_near, 5), (job_far, 95)]),
+            route_with_jobs(actor_d1, vec![]),
+        ])
+        .build();
+
+    // Nothing is cached before the pass, and with shares there is no static quota to fall back on.
+    assert!(ctx.solution.routes[0].state().get_territory_route_quota().is_none());
+
+    feature.state.as_ref().unwrap().accept_solution_state(&mut ctx.solution);
+
+    // Closed tour 0 -> 5 -> 95 -> 0 is 5 + 90 + 95 = 190, split by two equal shares.
+    let loaded = ctx.solution.routes[0].state().get_territory_route_quota().copied().unwrap();
+    let idle = ctx.solution.routes[1].state().get_territory_route_quota().copied().unwrap();
+    assert_eq!(loaded, 95.0);
+    assert_eq!(idle, 95.0, "the idle driver owes its share too, which is what makes it a deficit");
 }
