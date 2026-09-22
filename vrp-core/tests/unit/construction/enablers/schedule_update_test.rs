@@ -115,8 +115,9 @@ fn can_calculate_statistics_with_depot_to_last_job_span() {
     let total_distance = route_ctx.state().get_total_distance().copied().unwrap_or(0.);
     let total_duration = route_ctx.state().get_total_duration().copied().unwrap_or(0.);
 
-    // Distance: 0->10 + 10->30 + 30->60 = 10 + 20 + 30 = 60 (no return to depot)
-    assert_eq!(total_distance, 60., "DepotToLastJob distance should be 60");
+    // Distance is span-blind: the whole route, 0->10 + 10->30 + 30->60 + 60->0 = 120. The span
+    // decides what the technician is PAID for, not which miles the vehicle drove.
+    assert_eq!(total_distance, 120., "DepotToLastJob distance is still the whole route");
     // Duration: last_job.departure(60) - start.departure(0) = 60
     assert_eq!(total_duration, 60., "DepotToLastJob duration should be 60");
 }
@@ -130,8 +131,8 @@ fn can_calculate_statistics_with_first_job_to_depot_span() {
     let total_distance = route_ctx.state().get_total_distance().copied().unwrap_or(0.);
     let total_duration = route_ctx.state().get_total_duration().copied().unwrap_or(0.);
 
-    // Distance: 10->30 + 30->60 + 60->0 = 20 + 30 + 60 = 110 (no outbound from depot)
-    assert_eq!(total_distance, 110., "FirstJobToDepot distance should be 110");
+    // Distance is span-blind: the whole route, including the outbound leg the span excludes.
+    assert_eq!(total_distance, 120., "FirstJobToDepot distance is still the whole route");
     // Duration: end.departure(130) - first_job.arrival(10) = 120
     assert_eq!(total_duration, 120., "FirstJobToDepot duration should be 120");
 }
@@ -145,8 +146,8 @@ fn can_calculate_statistics_with_first_job_to_last_job_span() {
     let total_distance = route_ctx.state().get_total_distance().copied().unwrap_or(0.);
     let total_duration = route_ctx.state().get_total_duration().copied().unwrap_or(0.);
 
-    // Distance: 10->30 + 30->60 = 20 + 30 = 50 (no depot legs)
-    assert_eq!(total_distance, 50., "FirstJobToLastJob distance should be 50");
+    // Distance is span-blind: the whole route, including both depot legs the span excludes.
+    assert_eq!(total_distance, 120., "FirstJobToLastJob distance is still the whole route");
     // Duration: last_job.departure(60) - first_job.arrival(10) = 50
     assert_eq!(total_duration, 50., "FirstJobToLastJob duration should be 50");
 }
@@ -170,10 +171,12 @@ fn can_calculate_statistics_with_default_span_when_not_set() {
 fn can_handle_single_job_route_with_all_spans() {
     // Create a route with only one job
     let test_cases = vec![
-        (Some(RouteCostSpan::DepotToDepot), 20., 40.), // 0->10 + 10->0 = 20, duration 40-0=40
-        (Some(RouteCostSpan::DepotToLastJob), 10., 20.), // 0->10 = 10, duration 20-0=20
-        (Some(RouteCostSpan::FirstJobToDepot), 10., 20.), // 10->0 = 10, duration 40-20=20
-        (Some(RouteCostSpan::FirstJobToLastJob), 0., 0.), // No distance between first and last (same job)
+        // Distance is the whole route (0->10 + 10->0 = 20) for every span; only the paid
+        // duration differs.
+        (Some(RouteCostSpan::DepotToDepot), 20., 40.), // duration 40-0=40
+        (Some(RouteCostSpan::DepotToLastJob), 20., 20.), // duration 20-0=20
+        (Some(RouteCostSpan::FirstJobToDepot), 20., 20.), // duration 40-20=20
+        (Some(RouteCostSpan::FirstJobToLastJob), 20., 0.), // one job: first and last coincide
     ];
 
     for (span, expected_distance, expected_duration) in test_cases {
@@ -316,9 +319,8 @@ fn can_calculate_statistics_for_open_vrp_with_first_job_to_depot_span() {
     let total_distance = route_ctx.state().get_total_distance().copied().unwrap_or(0.);
     let total_duration = route_ctx.state().get_total_duration().copied().unwrap_or(0.);
 
-    // Open VRP: no return depot, so this is first job to last job
-    // Distance: 10->30 + 30->60 = 20 + 30 = 50
-    assert_eq!(total_distance, 50., "Open VRP FirstJobToDepot distance should be 50");
+    // Span-blind, and an open tour has no end depot: 0->10 + 10->30 + 30->60 = 60.
+    assert_eq!(total_distance, 60., "Open VRP FirstJobToDepot distance is the whole route");
     // Duration: last_job.departure(60) - first_job.arrival(10) = 50
     assert_eq!(total_duration, 50., "Open VRP FirstJobToDepot duration should be 50");
 }
@@ -332,8 +334,8 @@ fn can_calculate_statistics_for_open_vrp_with_first_job_to_last_job_span() {
     let total_distance = route_ctx.state().get_total_distance().copied().unwrap_or(0.);
     let total_duration = route_ctx.state().get_total_duration().copied().unwrap_or(0.);
 
-    // Distance: 10->30 + 30->60 = 20 + 30 = 50
-    assert_eq!(total_distance, 50., "Open VRP FirstJobToLastJob distance should be 50");
+    // Span-blind, and an open tour has no end depot: 0->10 + 10->30 + 30->60 = 60.
+    assert_eq!(total_distance, 60., "Open VRP FirstJobToLastJob distance is the whole route");
     // Duration: last_job.departure(60) - first_job.arrival(10) = 50
     assert_eq!(total_duration, 50., "Open VRP FirstJobToLastJob duration should be 50");
 }
@@ -456,4 +458,22 @@ fn can_skip_an_offset_anchored_activity_when_choosing_the_anchor() {
 
     // 40. is the customer's arrival, 20. the break's — the break must not become the anchor.
     assert_eq!(get_offset_anchor(&route), 40.);
+}
+
+#[test]
+fn total_distance_covers_depot_legs_while_duration_does_not() {
+    // Miles are vehicle cost: they are incurred on the commute legs whether or not the technician
+    // is on the clock for them, and the cost model bills the whole route. Duration is the
+    // opposite and keeps the span the vehicle is paid for.
+    let (mut route_ctx, transport) = create_test_route_with_cost_span(Some(RouteCostSpan::FirstJobToLastJob));
+
+    update_statistics(&mut route_ctx, &transport);
+
+    let total_distance = route_ctx.state().get_total_distance().copied().unwrap_or(0.);
+    let total_duration = route_ctx.state().get_total_duration().copied().unwrap_or(0.);
+
+    // Whole route: 0->10 + 10->30 + 30->60 + 60->0 = 120, both depot legs included.
+    assert_eq!(total_distance, 120., "distance must cover the depot legs whatever the span");
+    // Paid span only: last_job.departure(60) - first_job.arrival(10) = 50.
+    assert_eq!(total_duration, 50., "duration must stay inside the paid span");
 }
