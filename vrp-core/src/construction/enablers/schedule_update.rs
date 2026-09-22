@@ -234,7 +234,7 @@ fn update_statistics(route_ctx: &mut RouteContext, transport: &dyn TransportCost
     let cost_span = route.actor.vehicle.dimens.get_route_cost_span().copied().unwrap_or_default();
 
     let total_dur = calculate_route_duration(route, cost_span, total_activities, start, end);
-    let total_dist = calculate_route_distance(route, transport, cost_span, total_activities);
+    let total_dist = calculate_route_distance(route, transport, total_activities);
 
     state.set_total_distance(total_dist);
     state.set_total_duration(total_dur);
@@ -312,49 +312,24 @@ fn calculate_route_duration(
     }
 }
 
-fn calculate_route_distance(
-    route: &Route,
-    transport: &dyn TransportCost,
-    cost_span: RouteCostSpan,
-    total_activities: usize,
-) -> Distance {
-    let last_job_idx = get_last_job_idx(route, total_activities);
+fn calculate_route_distance(route: &Route, transport: &dyn TransportCost, total_activities: usize) -> Distance {
+    // Deliberately span-blind, unlike `calculate_route_duration`. Miles are vehicle cost — fuel,
+    // wear, leasing — and they are incurred on the commute legs whether or not the technician is
+    // on the clock for them. The cost model bills the whole route for exactly that reason
+    // ("Distance Cost (always full distance, regardless of pay period)"), and a distance trimmed
+    // by the pay period would have the solver optimise one quantity while the invoice charges
+    // another.
+    if total_activities <= 1 {
+        return Distance::default();
+    }
 
-    let (start_idx, end_idx) = match cost_span {
-        RouteCostSpan::DepotToDepot => (0, total_activities),
-        RouteCostSpan::DepotToLastJob => {
-            // For open tours, last job IS the last activity
-            if let Some(last_idx) = last_job_idx {
-                (0, last_idx + 1)
-            } else {
-                return Distance::default();
-            }
-        }
-        RouteCostSpan::FirstJobToDepot => {
-            // For open tours, "depot" is the last activity (which is the last job)
-            if has_jobs(route, total_activities) {
-                (1, total_activities)
-            } else {
-                return Distance::default();
-            }
-        }
-        RouteCostSpan::FirstJobToLastJob => {
-            if let Some(last_idx) = last_job_idx {
-                (1, last_idx + 1)
-            } else {
-                return Distance::default();
-            }
-        }
-    };
-
-    let start_activity = route.tour.get(start_idx).unwrap();
+    let start_activity = route.tour.get(0).unwrap();
     let init = (start_activity.place.location, start_activity.schedule.departure, Distance::default());
 
     route
         .tour
         .all_activities()
-        .skip(start_idx + 1)
-        .take(end_idx - start_idx - 1)
+        .skip(1)
         .fold(init, |(loc, dep, total_dist), a| {
             let dist = total_dist + transport.distance(route, loc, a.place.location, TravelTime::Departure(dep));
             (a.place.location, a.schedule.departure, dist)
