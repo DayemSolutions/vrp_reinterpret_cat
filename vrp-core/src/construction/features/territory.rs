@@ -362,6 +362,14 @@ struct TerritoryShared {
     /// fitness must share this normalization or the estimate steers on a different exchange rate
     /// than the fitness it approximates.
     avg_metric: Float,
+    /// Precomputed per job id: the shortest round trip from any COMPATIBLE vehicle start to the
+    /// job and back, in the balance metric's unit.
+    ///
+    /// Not what the balance measures — that is [`Self::route_load`] — but a per-job quantity in the
+    /// same unit, which two places need: [`Self::compute_avg_metric`], to express PUSH's surplus in
+    /// jobs' worth so [`PUSH_CONVEXITY_GAIN`] means the same thing whatever is balanced, and
+    /// [`Self::push_marginal`]'s value factor. Static, so `avg_metric` stays a build-time constant.
+    job_travel_estimate: HashMap<String, Float>,
     /// The PUSH marginal's reach: the median per-job power gap. A job whose gap exceeds this sits
     /// too deep in its cell to be worth shedding for balance, so its PUSH marginal is zero (it stays
     /// home); jobs within reach of a boundary are the ones balance may push to a neighbour.
@@ -414,6 +422,7 @@ impl TerritoryShared {
             quotas_supplied,
             reference: 1.0,
             job_anchor_ranking: HashMap::new(),
+            job_travel_estimate: HashMap::new(),
             job_nearest_power: HashMap::new(),
             job_second_power: HashMap::new(),
             avg_metric: 1.0,
@@ -424,6 +433,7 @@ impl TerritoryShared {
         };
         // Precompute the static anchor lookups first; quotas/reference/power reuse them.
         shared.job_anchor_ranking = shared.compute_job_anchor_ranking(&jobs);
+        shared.job_travel_estimate = shared.compute_job_travel_estimate(&jobs);
         shared.job_nearest_power = shared.compute_job_nearest_power();
         shared.job_second_power = shared.compute_job_second_power();
         shared.avg_metric = shared.compute_avg_metric(&jobs);
@@ -465,9 +475,13 @@ impl TerritoryShared {
             None => 0.0,
             Some(TerritoryBalance::Activities) => 1.0,
             Some(TerritoryBalance::ProductionValue) => (self.job_value_fn)(job),
-            Some(TerritoryBalance::Distance) | Some(TerritoryBalance::Duration) => {
-                get_job_location(job).map(|loc| self.nearest_anchor_prox(loc, job)).unwrap_or(0.0)
-            }
+            // The per-job ESTIMATE, not the measurement: see [`Self::job_travel_estimate`].
+            Some(TerritoryBalance::Distance) | Some(TerritoryBalance::Duration) => job
+                .dimens()
+                .get_job_id()
+                .and_then(|id| self.job_travel_estimate.get(id))
+                .copied()
+                .unwrap_or(0.0),
         }
     }
 
@@ -612,6 +626,40 @@ impl TerritoryShared {
                 (id.clone(), powers.get(1).copied().unwrap_or(Float::INFINITY))
             })
             .collect()
+    }
+
+    /// See [`Self::job_travel_estimate`]. Compatibility-aware, so a job counts only the vehicles
+    /// that may actually serve it; a job no vehicle may serve estimates at 0.0 and never enters a
+    /// route anyway.
+    fn compute_job_travel_estimate(&self, jobs: &Jobs) -> HashMap<String, Float> {
+        jobs.all()
+            .iter()
+            .filter_map(|job| {
+                let id = job.dimens().get_job_id()?.clone();
+                let loc = get_job_location(job)?;
+                let best = self
+                    .actors
+                    .iter()
+                    .filter(|actor| (self.compatibility_fn)(job, actor))
+                    .filter_map(|actor| actor.detail.start.as_ref().map(|place| place.location))
+                    .map(|start| self.travel(start, loc) + self.travel(loc, start))
+                    .min_by(|a, b| a.total_cmp(b))
+                    .unwrap_or(0.0);
+                Some((id, best))
+            })
+            .collect()
+    }
+
+    /// Travel between two locations in the BALANCE metric's unit.
+    ///
+    /// ⚠️ Deliberately distinct from [`Self::proximity`], which answers in the TERRITORY metric's
+    /// unit. The two are configured separately and a solve may well balance on duration while its
+    /// territories are drawn by distance.
+    fn travel(&self, from: Location, to: Location) -> Float {
+        match self.balance {
+            Some(TerritoryBalance::Duration) => self.transport.duration_approx(&self.profile, from, to),
+            _ => self.transport.distance_approx(&self.profile, from, to),
+        }
     }
 
     /// The average balance metric per job (floored positive). Used to normalize the PUSH marginal

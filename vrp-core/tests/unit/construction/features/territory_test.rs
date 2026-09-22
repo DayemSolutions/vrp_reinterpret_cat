@@ -1181,3 +1181,18 @@ fn route_load_still_sums_jobs_for_counting_targets() {
 
     assert_eq!(fixture.shared.route_load(&route_ctx), 2.0, "two jobs are two activities");
 }
+
+/// `route_load` is what the balance MEASURES, but two places still need a per-job quantity in the
+/// same unit: `compute_avg_metric`, which converts PUSH's surplus into "jobs' worth" so
+/// `PUSH_CONVEXITY_GAIN` keeps its meaning, and `push_marginal`'s value factor. That quantity is
+/// the job's ideal round trip from its nearest compatible vehicle start — never its distance to an
+/// anchor, which is how far the old proxy was from real travel.
+#[test]
+fn job_metric_for_travel_targets_is_the_ideal_round_trip() {
+    // Vehicle starts at 0, anchor sits ON the job at 5, so the anchor distance is 5 while the
+    // round trip is 10.
+    let fixture = shared_over(&[("d0", 5, 1000.0)], &[5], Some(TerritoryBalance::Distance), HashMap::new());
+    let job = Job::Single(fixture.singles[0].clone());
+
+    assert_eq!(fixture.shared.job_metric(&job), 10.0, "the estimate must be the round trip, not the anchor hop");
+}
