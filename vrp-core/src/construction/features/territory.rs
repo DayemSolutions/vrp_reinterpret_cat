@@ -92,6 +92,15 @@ pub enum TerritoryBalance {
     Duration,
     /// Balances on job (activity) count.
     Activities,
+    /// Balances on time spent AT customers — service only, no travel.
+    ///
+    /// The cheap sibling of [`Self::Duration`]. Duration balances service plus drive, which is what
+    /// the technician is on the clock for, but it is self-referential: moving a job to a distant
+    /// technician adds drive time to the very load being levelled, so the objective partly undoes
+    /// itself and buys its fairness in miles. Service time is invariant to who performs it, so
+    /// levelling it has no such feedback and leaves the transport objective free to keep the plan
+    /// tight.
+    Service,
     /// Balances on a caller-supplied per-job production value (see
     /// [`TerritoryFeatureBuilder::set_job_value_fn`]).
     ProductionValue,
@@ -532,6 +541,7 @@ impl TerritoryShared {
         match self.balance {
             None => 0.0,
             Some(TerritoryBalance::Activities) => 1.0,
+            Some(TerritoryBalance::Service) => self.service_share(job),
             Some(TerritoryBalance::ProductionValue) => (self.job_value_fn)(job),
             // The per-job ESTIMATE, not the measurement: see [`Self::job_travel_estimate`].
             Some(TerritoryBalance::Distance) | Some(TerritoryBalance::Duration) => job
@@ -774,7 +784,7 @@ impl TerritoryShared {
     ///
     /// For `Distance` it is zero: standing still drives no miles.
     fn service_share(&self, job: &Job) -> Float {
-        if !matches!(self.balance, Some(TerritoryBalance::Duration)) {
+        if !matches!(self.balance, Some(TerritoryBalance::Duration) | Some(TerritoryBalance::Service)) {
             return 0.0;
         }
 
@@ -794,6 +804,9 @@ impl TerritoryShared {
     fn travel(&self, from: Location, to: Location) -> Float {
         match self.balance {
             Some(TerritoryBalance::Duration) => self.transport.duration_approx(&self.profile, from, to),
+            // Service balances a quantity travel is no part of, so the estimate carries none
+            // either — see the caller, which adds only `service_share`.
+            Some(TerritoryBalance::Service) => 0.0,
             _ => self.transport.distance_approx(&self.profile, from, to),
         }
     }
@@ -886,9 +899,9 @@ impl TerritoryShared {
     fn route_load(&self, route_ctx: &RouteContext) -> Float {
         match self.balance {
             None => 0.0,
-            Some(TerritoryBalance::Activities) | Some(TerritoryBalance::ProductionValue) => {
-                route_ctx.route().tour.jobs().map(|j| self.job_metric(j)).sum()
-            }
+            Some(TerritoryBalance::Activities)
+            | Some(TerritoryBalance::ProductionValue)
+            | Some(TerritoryBalance::Service) => route_ctx.route().tour.jobs().map(|j| self.job_metric(j)).sum(),
             Some(TerritoryBalance::Distance) => route_ctx.state().get_total_distance().copied().unwrap_or(0.0),
             Some(TerritoryBalance::Duration) => {
                 route_ctx.state().get_paid_working_duration().copied().unwrap_or(0.0)
@@ -1062,18 +1075,12 @@ impl TerritoryShared {
         // Supplied SHARES have no static quota to fall back to, and that is correct rather than a
         // gap: their level is a property of a solution, and before one exists there is no imbalance
         // to price.
-        let route_capacity = (actor.detail.time.end - actor.detail.time.start).max(0.0);
-        let route_quota = match route_ctx.state().get_territory_route_quota().copied() {
-            Some(cached) => cached,
-            None => {
-                let Some(&driver_quota) = self.quotas.get(&key) else { return 0.0 };
-                let driver_capacity = self.caps.get(&key).copied().unwrap_or(0.0);
-                if driver_capacity <= 0.0 {
-                    return 0.0;
-                }
-                driver_quota * route_capacity / driver_capacity
-            }
-        };
+        // This route's own slice of its driver's quota, cached by `cache_route_quotas` — one rule,
+        // written in one place, for both quota modes. Absent before the first solution-state pass,
+        // which reads as no shedding pressure: the slice depends on which routes the driver
+        // actually has, and before a solution exists there is no answer to that. It is also when
+        // there is nothing to shed.
+        let route_quota = route_ctx.state().get_territory_route_quota().copied().unwrap_or(0.0);
         if route_quota <= 0.0 {
             return 0.0;
         }
@@ -1178,14 +1185,34 @@ impl TerritoryState {
         let loads = self.shared.loads(solution_ctx);
         let quotas = self.shared.effective_quotas(&loads);
 
+        // ⚠️ Spread over the routes the driver ACTUALLY has, not over every shift they own.
+        //
+        // A quota spans the horizon while a route is one day, so the two have to be brought onto
+        // one scale — but dividing by the driver's whole capacity assumes every shift becomes a
+        // route. It does not: a technician with nineteen shifts may work ten. Their load then lands
+        // on ten routes while each is measured against a nineteenth of the quota, so EVERY route
+        // reads as over quota, permanently and for every driver — including the ones who are far
+        // under their share and ought to be receiving work. The marginal then sheds from everybody
+        // and discriminates between nobody.
+        //
+        // Against the active capacity the two sides add up: the driver's route quotas sum to their
+        // quota exactly as their route loads sum to their load, so a driver sitting at quota has no
+        // route over it, and a day carrying more than its peers still does.
+        let mut active_capacity: HashMap<DriverKey, Float> = HashMap::new();
+        for route_ctx in solution_ctx.routes.iter() {
+            let actor = &route_ctx.route().actor;
+            *active_capacity.entry(driver_key(actor)).or_insert(0.0) +=
+                (actor.detail.time.end - actor.detail.time.start).max(0.0);
+        }
+
         for route_ctx in solution_ctx.routes.iter_mut() {
             let actor = &route_ctx.route().actor;
             let key = driver_key(actor);
-            let driver_capacity = self.shared.caps.get(&key).copied().unwrap_or(0.0);
+            let capacity = active_capacity.get(&key).copied().unwrap_or(0.0);
             let route_capacity = (actor.detail.time.end - actor.detail.time.start).max(0.0);
 
             let route_quota = match quotas.get(&key) {
-                Some(&driver_quota) if driver_capacity > 0.0 => driver_quota * route_capacity / driver_capacity,
+                Some(&driver_quota) if capacity > 0.0 => driver_quota * route_capacity / capacity,
                 _ => 0.0,
             };
 

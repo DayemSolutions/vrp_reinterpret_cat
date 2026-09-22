@@ -346,6 +346,8 @@ fn per_tour_metric_totals(
                 BalancePeriodMetric::Distance => tour.statistic.distance as Float,
                 BalancePeriodMetric::Duration => tour.statistic.duration as Float,
                 BalancePeriodMetric::Activities => tour_job_ids(tour).count() as Float,
+                // Service is a per-job sum like the two below it, not a route property.
+                BalancePeriodMetric::Service => tour.statistic.times.serving as Float,
                 BalancePeriodMetric::ProductionValue => {
                     tour_job_ids(tour).map(|id| job_value.get(id).copied().unwrap_or(0.)).sum()
                 }
