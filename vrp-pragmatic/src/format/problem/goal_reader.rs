@@ -14,7 +14,7 @@ use vrp_core::construction::features::*;
 use vrp_core::construction::features::TerritoryProximity as CoreTerritoryProximity;
 use vrp_core::construction::heuristics::InsertionContext;
 use vrp_core::models::common::{Demand, Location as CoreLocation, LoadOps, MultiDimLoad, SingleDimLoad};
-use vrp_core::models::problem::{Actor, Job as CoreJob, Single, TransportCost};
+use vrp_core::models::problem::{Actor, Job as CoreJob, Single, TransportCost, driver_key};
 use vrp_core::models::solution::Route;
 use vrp_core::models::{Feature, FeatureObjective, GoalBuilder, GoalContext, GoalContextBuilder};
 use vrp_core::rosomaxa::evolution::objectives::dominance_order;
@@ -240,14 +240,15 @@ fn get_objective_feature_layer(
             })
         }
         Objective::BalancePeriod { metric } => {
+            // Grouped by `driver_key`, not by vehicle id: a technician whose max duration or
+            // absence-cover tags vary by day is emitted as SEVERAL vehicles, and grouping on the
+            // vehicle would split one person into several groups, each with its own shift count.
             let group_capacities: HashMap<String, usize> =
                 blocks.fleet.actors.iter().fold(HashMap::new(), |mut acc, actor| {
-                    if let Some(vehicle_id) = actor.vehicle.dimens.get_vehicle_id() {
-                        *acc.entry(vehicle_id.clone()).or_insert(0) += 1;
-                    }
+                    *acc.entry(driver_key(actor)).or_insert(0) += 1;
                     acc
                 });
-            let group_key_fn = |actor: &Actor| actor.vehicle.dimens.get_vehicle_id().cloned();
+            let group_key_fn = |actor: &Actor| Some(driver_key(actor));
 
             // Fixed per-problem reference used to self-normalize the balance objective so its
             // weight in a scalarizing multi-objective is a dimensionless preference on the same

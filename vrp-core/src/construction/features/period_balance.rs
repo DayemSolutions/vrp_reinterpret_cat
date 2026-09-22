@@ -16,8 +16,11 @@ type SolutionFitnessFn = Arc<dyn Fn(&SolutionContext) -> Float + Send + Sync>;
 /// Creates a feature which balances a work metric (e.g. distance, duration, activity count or
 /// production value) per employee across the whole planning period, instead of per tour.
 ///
-/// Tours are grouped by `group_key_fn` (typically the employee's `vehicle_id`, which is shared
-/// across all `VehicleType` splits of the same employee). For each group, the summed
+/// Tours are grouped by `group_key_fn` — `driver_key`, which is the one identity every feature
+/// meaning "the same person" shares. ⚠️ Not the vehicle id: a technician whose max duration or
+/// skills vary by day is emitted as several vehicles, so grouping on the vehicle splits one person
+/// into several groups, each with its own shift count, and the deviation then measures people who
+/// do not exist. For each group, the summed
 /// `tour_metric_fn` value across all of its tours is normalized by its available capacity (e.g.
 /// amount of available shifts) taken from `group_capacities`. Every key present in
 /// `group_capacities` contributes a ratio to the balance calculation, even if the employee has no
