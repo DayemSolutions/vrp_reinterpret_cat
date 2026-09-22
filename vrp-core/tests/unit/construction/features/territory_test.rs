@@ -4,7 +4,9 @@ use crate::construction::features::territory::{
 use crate::construction::features::{
     TerritoryBalance, TerritoryFeatureBuilder, TerritoryFitnessData, TerritoryProximity,
 };
-use crate::construction::enablers::{TotalDistanceTourState, TotalDurationTourState};
+use crate::construction::enablers::{
+    PaidWorkingDurationTourState, TotalDistanceTourState, TotalDurationTourState,
+};
 use crate::construction::heuristics::{InsertionContext, MoveContext, RouteContext, RouteState};
 use crate::helpers::construction::heuristics::TestInsertionContextBuilder;
 use crate::helpers::models::domain::test_logger;
@@ -85,6 +87,9 @@ fn route_with_jobs(actor: Arc<Actor>, jobs: Vec<(Arc<Single>, usize)>) -> RouteC
     let total = closed_tour_travel(&locations);
     route_ctx.state_mut().set_total_distance(total);
     route_ctx.state_mut().set_total_duration(total);
+    // These activities carry no service time, so over the default depot-to-depot span the paid
+    // working duration is the same travel the other two totals are.
+    route_ctx.state_mut().set_paid_working_duration(total);
 
     route_ctx
 }
@@ -1165,12 +1170,12 @@ fn push_total_does_not_depend_on_the_hash_seed() {
 // endregion
 
 /// `Distance` and `Duration` are properties of a ROUTE: travel depends on the order the stops are
-/// visited, so no per-job term can express it. Both read the state the transport feature already
-/// maintains — `get_total_duration()` is the paid span under the vehicle's `RouteCostSpan`,
-/// `get_total_distance()` is the whole route.
+/// visited, so no per-job term can express it. Both read a total the transport feature already
+/// maintains — `get_total_distance()` is the whole route, and `get_paid_working_duration()` is the
+/// paid span with the idle taken out, which is the part of it an assignment actually decides.
 #[test]
 fn route_load_measures_the_route_for_travel_targets() {
-    for (balance, duration, distance, expected) in [
+    for (balance, worked, distance, expected) in [
         (TerritoryBalance::Duration, 777.0, 999.0, 777.0),
         (TerritoryBalance::Distance, 777.0, 999.0, 999.0),
     ] {
@@ -1179,7 +1184,10 @@ fn route_load_measures_the_route_for_travel_targets() {
             fixture.actors[0].clone(),
             vec![(fixture.singles[0].clone(), 5), (fixture.singles[1].clone(), 95)],
         );
-        route_ctx.state_mut().set_total_duration(duration);
+        route_ctx.state_mut().set_paid_working_duration(worked);
+        // Deliberately different, so a load reading the raw span instead of the worked part fails
+        // here rather than in a campaign.
+        route_ctx.state_mut().set_total_duration(worked * 3.0);
         route_ctx.state_mut().set_total_distance(distance);
 
         assert_eq!(fixture.shared.route_load(&route_ctx), expected, "{balance:?} must read the route's own total");
@@ -1346,4 +1354,51 @@ fn the_solution_state_caches_each_route_s_slice_of_the_quota() {
     let idle = ctx.solution.routes[1].state().get_territory_route_quota().copied().unwrap();
     assert_eq!(loaded, 95.0);
     assert_eq!(idle, 95.0, "the idle driver owes its share too, which is what makes it a deficit");
+}
+
+/// The `Duration` estimate has to carry the job's SERVICE time as well, because the route load it
+/// estimates is the paid span — service plus idle plus the drive between jobs — and on a
+/// field-service day the service dominates. Travel alone would price a two-hour visit next door
+/// below a ten-minute visit across town.
+#[test]
+fn the_duration_estimate_carries_service_time_as_well_as_travel() {
+    let mut builder = TestSingleBuilder::default();
+    builder.id("job_near").location(Some(5)).duration(600.0);
+    let job = Job::Single(builder.build_shared());
+
+    let fleet = {
+        let mut fleet_builder = FleetBuilder::default();
+        fleet_builder.add_driver(test_driver());
+        let mut vehicle_builder = TestVehicleBuilder::default();
+        vehicle_builder.id("v_d0").details(vec![VehicleDetail {
+            start: Some(VehiclePlace { location: 0, time: TimeInterval { earliest: Some(0.0), latest: None } }),
+            end: Some(VehiclePlace { location: 0, time: TimeInterval { earliest: None, latest: Some(1000.0) } }),
+        }]);
+        vehicle_builder.dimens_mut().set_driver_id("d0".to_string());
+        fleet_builder.add_vehicle(vehicle_builder.build());
+        fleet_builder.build()
+    };
+    let actor = get_test_actor_from_fleet(&fleet, "v_d0");
+    let transport = TestTransportCost::new_shared();
+    let jobs = Arc::new(Jobs::new(&fleet, vec![job.clone()], transport.as_ref(), &test_logger()).unwrap());
+
+    let shared = TerritoryShared::new(
+        transport,
+        vec![actor],
+        jobs,
+        Arc::new(|_: &Job, _: &Actor| true),
+        TerritoryProximity::Distance,
+        Some(TerritoryBalance::Duration),
+        0.0,
+        HashMap::from([("d0".to_string(), vec![0usize])]),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        Arc::new(|_: &Job| 1.0),
+        false,
+    );
+
+    // Round trip 0 -> 5 -> 0 is 10; the visit itself is 600.
+    assert_eq!(shared.job_metric(&job), 610.0);
 }

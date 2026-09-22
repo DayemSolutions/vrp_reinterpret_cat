@@ -5,6 +5,7 @@ use crate::construction::enablers::{
 use crate::helpers::models::problem::*;
 use crate::helpers::models::solution::*;
 use crate::models::common::{Location, Schedule, TimeInterval, TimeOffset, TimeSpan, TimeWindow, Timestamp};
+use crate::construction::enablers::PaidWorkingDurationTourState;
 use crate::models::problem::{RouteCostSpan, RouteCostSpanDimension, VehicleDetail, VehiclePlace};
 use std::sync::Arc;
 
@@ -481,4 +482,29 @@ fn total_distance_covers_depot_legs_while_duration_does_not() {
     assert_eq!(total_distance, 120., "distance must cover the depot legs whatever the span");
     // Paid span only: last_job.departure(60) - first_job.arrival(10) = 50.
     assert_eq!(total_duration, 50., "duration must stay inside the paid span");
+}
+
+#[test]
+fn paid_working_duration_is_the_span_without_its_idle() {
+    // The fixture's activities carry no service time, so over depot-to-depot the worked duration
+    // is the whole route's travel: 0->10 + 10->30 + 30->60 + 60->0 = 120. The span is 130, the
+    // extra ten seconds being idle the schedule leaves between arrival and departure.
+    let (mut route_ctx, transport) = create_test_route_with_cost_span(Some(RouteCostSpan::DepotToDepot));
+
+    update_statistics(&mut route_ctx, &transport);
+
+    assert_eq!(route_ctx.state().get_paid_working_duration().copied().unwrap_or(0.), 120.);
+    assert_eq!(route_ctx.state().get_total_duration().copied().unwrap_or(0.), 130.);
+}
+
+#[test]
+fn paid_working_duration_counts_only_the_legs_the_span_pays_for() {
+    // first-job-to-last-job: 10->30 + 30->60 = 50, neither depot leg.
+    let (mut route_ctx, transport) = create_test_route_with_cost_span(Some(RouteCostSpan::FirstJobToLastJob));
+
+    update_statistics(&mut route_ctx, &transport);
+
+    assert_eq!(route_ctx.state().get_paid_working_duration().copied().unwrap_or(0.), 50.);
+    // ...while the distance beside it is span-blind and still covers the whole route.
+    assert_eq!(route_ctx.state().get_total_distance().copied().unwrap_or(0.), 120.);
 }
