@@ -460,6 +460,11 @@ fn can_skip_an_offset_anchored_activity_when_choosing_the_anchor() {
     assert_eq!(get_offset_anchor(&route), 40.);
 }
 
+/// ⚠️ These numbers are duplicated on the app side, on purpose. The territory objective balances
+/// on what `calculate_route_duration` returns, and the app bills what its own `ResolvePaidSeconds`
+/// returns; two implementations of one formula drift silently, so `tests/Unit/Shared/PayPeriodTest.php`
+/// states the same route — depot departure 0, first job arrival 10, last job departure 60, depot
+/// arrival 130 — and asserts the same four spans.
 #[test]
 fn total_distance_covers_depot_legs_while_duration_does_not() {
     // Miles are vehicle cost: they are incurred on the commute legs whether or not the technician
