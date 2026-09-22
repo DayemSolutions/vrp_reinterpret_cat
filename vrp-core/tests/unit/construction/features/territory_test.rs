@@ -2,11 +2,13 @@ use crate::construction::features::territory::{TerritoryFitnessSolutionState, Te
 use crate::construction::features::{
     TerritoryBalance, TerritoryFeatureBuilder, TerritoryFitnessData, TerritoryProximity,
 };
+use crate::construction::enablers::{TotalDistanceTourState, TotalDurationTourState};
 use crate::construction::heuristics::{InsertionContext, MoveContext, RouteContext, RouteState};
 use crate::helpers::construction::heuristics::TestInsertionContextBuilder;
 use crate::helpers::models::domain::test_logger;
 use crate::helpers::models::problem::{
-    FleetBuilder, TestSingleBuilder, TestTransportCost, TestVehicleBuilder, get_test_actor_from_fleet, test_driver,
+    FleetBuilder, TestSingleBuilder, TestTransportCost, TestVehicleBuilder, fake_routing, get_test_actor_from_fleet,
+    test_driver,
 };
 use crate::helpers::models::solution::ActivityBuilder;
 use crate::models::Feature;
@@ -54,6 +56,8 @@ fn route_with(actor: Arc<Actor>, job: Arc<Single>, job_location: usize) -> Route
 /// where a route may need several jobs (to create a surplus) or none at all (to create a
 /// deficit).
 fn route_with_jobs(actor: Arc<Actor>, jobs: Vec<(Arc<Single>, usize)>) -> RouteContext {
+    let locations: Vec<usize> = jobs.iter().map(|(_, location)| *location).collect();
+
     let route = Route {
         actor,
         tour: {
@@ -66,7 +70,38 @@ fn route_with_jobs(actor: Arc<Actor>, jobs: Vec<(Arc<Single>, usize)>) -> RouteC
             tour
         },
     };
-    RouteContext::new_with_state(route, RouteState::default())
+
+    let mut route_ctx = RouteContext::new_with_state(route, RouteState::default());
+
+    // These routes are assembled by hand and never see `update_statistics`, so the totals the
+    // transport feature would have cached are written here instead. `Distance` and `Duration`
+    // balance on exactly those, and a fixture that left them unset would read as a route that
+    // travelled nowhere — which passes for the wrong reason rather than failing.
+    //
+    // The model matches `TestTransportCost` (distance == duration == |from - to|) over the closed
+    // tour 0 -> job -> ... -> job -> 0.
+    let total = closed_tour_travel(&locations);
+    route_ctx.state_mut().set_total_distance(total);
+    route_ctx.state_mut().set_total_duration(total);
+
+    route_ctx
+}
+
+/// Whole-route travel over `0 -> locations... -> 0` under `TestTransportCost`.
+fn closed_tour_travel(locations: &[usize]) -> Float {
+    if locations.is_empty() {
+        return 0.0;
+    }
+
+    let mut previous = 0usize;
+    let mut total = 0.0;
+
+    for location in locations {
+        total += fake_routing(previous, *location);
+        previous = *location;
+    }
+
+    total + fake_routing(previous, 0)
 }
 
 /// Builds a territory feature plus two insertion contexts over a fixed two-driver, two-job
@@ -1110,3 +1145,39 @@ fn push_total_does_not_depend_on_the_hash_seed() {
 }
 
 // endregion
+
+/// `Distance` and `Duration` are properties of a ROUTE: travel depends on the order the stops are
+/// visited, so no per-job term can express it. Both read the state the transport feature already
+/// maintains — `get_total_duration()` is the paid span under the vehicle's `RouteCostSpan`,
+/// `get_total_distance()` is the whole route.
+#[test]
+fn route_load_measures_the_route_for_travel_targets() {
+    for (balance, duration, distance, expected) in [
+        (TerritoryBalance::Duration, 777.0, 999.0, 777.0),
+        (TerritoryBalance::Distance, 777.0, 999.0, 999.0),
+    ] {
+        let fixture = shared_over(&[("d0", 0, 1000.0)], &[5, 95], Some(balance), HashMap::new());
+        let mut route_ctx = route_with_jobs(
+            fixture.actors[0].clone(),
+            vec![(fixture.singles[0].clone(), 5), (fixture.singles[1].clone(), 95)],
+        );
+        route_ctx.state_mut().set_total_duration(duration);
+        route_ctx.state_mut().set_total_distance(distance);
+
+        assert_eq!(fixture.shared.route_load(&route_ctx), expected, "{balance:?} must read the route's own total");
+    }
+}
+
+/// The two counting targets stay per-job sums — a stop is a stop wherever it sits in the tour.
+#[test]
+fn route_load_still_sums_jobs_for_counting_targets() {
+    let fixture = shared_over(&[("d0", 0, 1000.0)], &[5, 95], Some(TerritoryBalance::Activities), HashMap::new());
+    let mut route_ctx = route_with_jobs(
+        fixture.actors[0].clone(),
+        vec![(fixture.singles[0].clone(), 5), (fixture.singles[1].clone(), 95)],
+    );
+    route_ctx.state_mut().set_total_duration(777.0);
+    route_ctx.state_mut().set_total_distance(999.0);
+
+    assert_eq!(fixture.shared.route_load(&route_ctx), 2.0, "two jobs are two activities");
+}
