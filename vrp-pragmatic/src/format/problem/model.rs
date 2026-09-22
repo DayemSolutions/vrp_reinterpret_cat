@@ -814,6 +814,9 @@ pub enum BalancePeriodMetric {
     /// Balances total amount of job activities.
     Activities,
 
+    /// Balances time spent AT customers — service only, no travel.
+    Service,
+
     /// Balances total job production value (the `productionValue` job property).
     ProductionValue,
 }

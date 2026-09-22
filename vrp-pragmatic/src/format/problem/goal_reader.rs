@@ -279,6 +279,13 @@ fn get_objective_feature_layer(
                     |route_ctx| route_ctx.route().tour.job_activity_count() as Float,
                     reference,
                 ),
+                BalancePeriodMetric::Service => create_period_balanced_feature(
+                    "period_balance",
+                    group_capacities,
+                    group_key_fn,
+                    |route_ctx| route_ctx.state().get_total_duration().copied().unwrap_or(0.),
+                    reference,
+                ),
                 BalancePeriodMetric::ProductionValue => create_period_balanced_feature(
                     "period_balance",
                     group_capacities,
@@ -600,6 +607,19 @@ fn compute_period_reference(metric: &BalancePeriodMetric, blocks: &ProblemBlocks
             .iter()
             .map(|job| job.dimens().get_production_value().copied().unwrap_or(0.))
             .sum(),
+        // Service time is the one metric whose ideal total is simply its actual total: it does not
+        // depend on the plan at all.
+        BalancePeriodMetric::Service => blocks
+            .jobs
+            .all()
+            .iter()
+            .map(|job| match job {
+                CoreJob::Single(single) => single.places.first().map(|p| p.duration).unwrap_or(0.),
+                CoreJob::Multi(multi) => {
+                    multi.jobs.iter().filter_map(|s| s.places.first().map(|p| p.duration)).sum()
+                }
+            })
+            .sum(),
         BalancePeriodMetric::Distance => {
             compute_ideal_round_trip_total(blocks.transport.as_ref(), &blocks.fleet.actors, blocks.jobs.all(), false)
         }
@@ -654,6 +674,7 @@ fn to_core_balance(balance: BalancePeriodMetric) -> TerritoryBalance {
         BalancePeriodMetric::Distance => TerritoryBalance::Distance,
         BalancePeriodMetric::Duration => TerritoryBalance::Duration,
         BalancePeriodMetric::Activities => TerritoryBalance::Activities,
+        BalancePeriodMetric::Service => TerritoryBalance::Service,
         BalancePeriodMetric::ProductionValue => TerritoryBalance::ProductionValue,
     }
 }

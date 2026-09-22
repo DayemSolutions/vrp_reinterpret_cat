@@ -675,12 +675,20 @@ fn push_marginal_sheds_boundary_jobs_not_deep_ones() {
     let objective = feature.objective.as_ref().unwrap();
 
     // d0 carries the three fillers -> load 3 > quota 2.5 -> over quota.
-    let mut route_ctx = route_with_jobs(a0, vec![(s[0].clone(), 1), (s[1].clone(), 2), (s[2].clone(), 3)]);
-    feature.state.as_ref().unwrap().accept_route_state(&mut route_ctx);
-
-    let ictx = TestInsertionContextBuilder::default().build();
+    //
+    // Driven through `accept_solution_state`, not `accept_route_state`: the route's slice of the
+    // quota depends on which routes its driver actually has, so it is the solution pass that
+    // computes it.
+    let mut ictx = TestInsertionContextBuilder::default()
+        .with_routes(vec![route_with_jobs(a0, vec![(s[0].clone(), 1), (s[1].clone(), 2), (s[2].clone(), 3)])])
+        .build();
+    feature.state.as_ref().unwrap().accept_solution_state(&mut ictx.solution);
     let estimate = |job: &Arc<Single>| {
-        objective.estimate(&MoveContext::route(&ictx.solution, &route_ctx, &Job::Single(job.clone())))
+        objective.estimate(&MoveContext::route(
+            &ictx.solution,
+            &ictx.solution.routes[0],
+            &Job::Single(job.clone()),
+        ))
     };
 
     let deepest = estimate(&s[0]); // gap 98 >= reach 94
@@ -777,20 +785,27 @@ fn push_marginal_fires_when_one_shift_of_several_is_over_its_share() {
         .unwrap();
     let objective = feature.objective.as_ref().unwrap();
 
-    // One of d0's two routes carries three of the six jobs.
-    let mut route_ctx = route_with_jobs(
-        d0_actors[0].clone(),
-        vec![(singles[0].clone(), 1), (singles[1].clone(), 2), (singles[2].clone(), 3)],
-    );
-    feature.state.as_ref().unwrap().accept_route_state(&mut route_ctx);
-
+    // d0 works BOTH of its shifts, and one of the two routes carries three of the six jobs while
+    // the other carries none. The driver is inside its horizon quota; the day is not.
+    let mut ictx = TestInsertionContextBuilder::default()
+        .with_routes(vec![
+            route_with_jobs(
+                d0_actors[0].clone(),
+                vec![(singles[0].clone(), 1), (singles[1].clone(), 2), (singles[2].clone(), 3)],
+            ),
+            route_with_jobs(d0_actors[1].clone(), vec![]),
+        ])
+        .build();
+    feature.state.as_ref().unwrap().accept_solution_state(&mut ictx.solution);
     // The control: measured against the horizon quota the route is INSIDE the band, which is exactly
     // why the old reading returned zero here.
     assert!(3.0 <= shared.over_quota(4.0), "the horizon-wide comparison must be inert on this fixture");
 
-    let ictx = TestInsertionContextBuilder::default().build();
-    let estimate =
-        objective.estimate(&MoveContext::route(&ictx.solution, &route_ctx, &Job::Single(singles[5].clone())));
+    let estimate = objective.estimate(&MoveContext::route(
+        &ictx.solution,
+        &ictx.solution.routes[0],
+        &Job::Single(singles[5].clone()),
+    ));
 
     assert_eq!(estimate, 252.0, "the route is over ITS share of the quota, so the marginal must fire");
 }
@@ -1401,4 +1416,59 @@ fn the_duration_estimate_carries_service_time_as_well_as_travel() {
 
     // Round trip 0 -> 5 -> 0 is 10; the visit itself is 600.
     assert_eq!(shared.job_metric(&job), 610.0);
+}
+
+/// `Service` levels time spent at customers and nothing else — no travel in the load, none in the
+/// estimate. It is the metric with no feedback: moving a job cannot change how long it takes.
+#[test]
+fn service_balances_time_at_customers_without_travel() {
+    let mut builder = TestSingleBuilder::default();
+    builder.id("job_0").location(Some(5)).duration(600.0);
+    let job = Job::Single(builder.build_shared());
+
+    let fleet = {
+        let mut fleet_builder = FleetBuilder::default();
+        fleet_builder.add_driver(test_driver());
+        let mut vehicle_builder = TestVehicleBuilder::default();
+        vehicle_builder.id("v_d0").details(vec![VehicleDetail {
+            start: Some(VehiclePlace { location: 0, time: TimeInterval { earliest: Some(0.0), latest: None } }),
+            end: Some(VehiclePlace { location: 0, time: TimeInterval { earliest: None, latest: Some(1000.0) } }),
+        }]);
+        vehicle_builder.dimens_mut().set_driver_id("d0".to_string());
+        fleet_builder.add_vehicle(vehicle_builder.build());
+        fleet_builder.build()
+    };
+    let actor = get_test_actor_from_fleet(&fleet, "v_d0");
+    let transport = TestTransportCost::new_shared();
+    let jobs = Arc::new(Jobs::new(&fleet, vec![job.clone()], transport.as_ref(), &test_logger()).unwrap());
+
+    let shared = TerritoryShared::new(
+        transport,
+        vec![actor.clone()],
+        jobs,
+        Arc::new(|_: &Job, _: &Actor| true),
+        TerritoryProximity::Distance,
+        Some(TerritoryBalance::Service),
+        0.0,
+        HashMap::from([("d0".to_string(), vec![0usize])]),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        Arc::new(|_: &Job| 1.0),
+        false,
+    );
+
+    // The visit, and not the ten seconds of driving the round trip would add.
+    assert_eq!(shared.job_metric(&job), 600.0);
+
+    let route_ctx = route_with_jobs(actor, vec![(shared_single(&shared), 5)]);
+    assert_eq!(shared.route_load(&route_ctx), 600.0, "the load is the sum over the tour's jobs");
+}
+
+/// The fixture's single job, for a test that needs it back out of the shared state.
+fn shared_single(_shared: &TerritoryShared) -> Arc<Single> {
+    let mut builder = TestSingleBuilder::default();
+    builder.id("job_0").location(Some(5)).duration(600.0);
+    builder.build_shared()
 }
