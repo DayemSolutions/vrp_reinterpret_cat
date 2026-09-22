@@ -345,29 +345,27 @@ fn nearest_anchor_prox(job_loc: (f64, f64), anchor_locations: &[(f64, f64)]) -> 
 }
 
 /// Per-tour totals of `metric`, indexed against the full vehicle roster like
-/// `activity_counts_per_tour`. `Distance`/`Duration` sum, over the tour's jobs, each job's
-/// proximity to its own *globally* nearest anchor (via `nearest_anchor_prox`) -- this is what the
-/// `territory` feature's `job_metric` actually bills for those metrics (see
-/// `TerritoryShared::job_metric` / `nearest_anchor_prox`), which is independent of the serving
-/// vehicle and therefore *not* the same as the tour's own driven-travel statistic. `Activities`
+/// `activity_counts_per_tour`. `Distance`/`Duration` read the tour's OWN travel, because that is
+/// what the territory objective balances: those two are properties of a route, not sums of a
+/// per-job term (see `TerritoryShared::route_load`). `Activities`
 /// counts real activities; `ProductionValue` sums each served job's value from `job_value`.
 fn per_tour_metric_totals(
     solution: &Solution,
     vehicle_ids: &[String],
     metric: &BalancePeriodMetric,
     job_value: &HashMap<String, Float>,
-    job_location: &HashMap<String, (f64, f64)>,
-    anchor_locations: &[(f64, f64)],
 ) -> Vec<Float> {
     vehicle_ids
         .iter()
         .map(|vid| {
             let Some(tour) = solution.tours.iter().find(|t| &t.vehicle_id == vid) else { return 0. };
             match metric {
-                BalancePeriodMetric::Distance | BalancePeriodMetric::Duration => tour_job_ids(tour)
-                    .filter_map(|id| job_location.get(id))
-                    .map(|&loc| nearest_anchor_prox(loc, anchor_locations))
-                    .sum(),
+                // The tour's own travel, not a sum of anchor proximities. Distance and Duration
+                // are properties of the route — that is what the objective balances now, and a
+                // check that still summed per-job proximities would be measuring the proxy this
+                // change removed.
+                BalancePeriodMetric::Distance => tour.statistic.distance as Float,
+                BalancePeriodMetric::Duration => tour.statistic.duration as Float,
                 BalancePeriodMetric::Activities => tour_job_ids(tour).count() as Float,
                 BalancePeriodMetric::ProductionValue => {
                     tour_job_ids(tour).map(|id| job_value.get(id).copied().unwrap_or(0.)).sum()
@@ -396,10 +394,8 @@ fn is_balanced_within_tolerance(
     vehicle_ids: &[String],
     metric: &BalancePeriodMetric,
     job_value: &HashMap<String, Float>,
-    job_location: &HashMap<String, (f64, f64)>,
-    anchor_locations: &[(f64, f64)],
 ) -> bool {
-    coefficient_of_variation(&per_tour_metric_totals(solution, vehicle_ids, metric, job_value, job_location, anchor_locations)) < 0.2
+    coefficient_of_variation(&per_tour_metric_totals(solution, vehicle_ids, metric, job_value)) < 0.2
 }
 
 /// True when every driver's `metric` total is within `band` (a fraction, e.g. 0.25 == 25%) of the
@@ -410,11 +406,9 @@ fn each_driver_within_quota_band(
     vehicle_ids: &[String],
     metric: &BalancePeriodMetric,
     job_value: &HashMap<String, Float>,
-    job_location: &HashMap<String, (f64, f64)>,
-    anchor_locations: &[(f64, f64)],
     band: Float,
 ) -> bool {
-    let totals = per_tour_metric_totals(solution, vehicle_ids, metric, job_value, job_location, anchor_locations);
+    let totals = per_tour_metric_totals(solution, vehicle_ids, metric, job_value);
     let mean = totals.iter().sum::<Float>() / totals.len() as Float;
     if mean.abs() < 1e-9 {
         return true;
@@ -483,27 +477,13 @@ fn territory_balances_for_each_metric() {
 
         assert!(solution.unassigned.is_none(), "metric {metric:?}: unexpected unassigned jobs: {:?}", solution.unassigned);
 
-        let totals = per_tour_metric_totals(
-            &solution,
-            &fixture.vehicle_ids,
-            &metric,
-            &fixture.job_value,
-            &fixture.job_location,
-            &fixture.anchor_locations,
-        );
+        let totals = per_tour_metric_totals(&solution, &fixture.vehicle_ids, &metric, &fixture.job_value);
         let cv = coefficient_of_variation(&totals);
         eprintln!("=== territory_balances_for_each_metric: {metric:?} ===");
         eprintln!("  per-tour totals: {totals:?}, cv: {cv:.3}");
 
         assert!(
-            is_balanced_within_tolerance(
-                &solution,
-                &fixture.vehicle_ids,
-                &metric,
-                &fixture.job_value,
-                &fixture.job_location,
-                &fixture.anchor_locations
-            ),
+            is_balanced_within_tolerance(&solution, &fixture.vehicle_ids, &metric, &fixture.job_value),
             "metric {metric:?} not balanced: totals={totals:?}, cv={cv:.3}"
         );
     }
@@ -528,8 +508,6 @@ fn territory_scales_to_many_drivers() {
         &fixture.vehicle_ids,
         &BalancePeriodMetric::ProductionValue,
         &fixture.job_value,
-        &fixture.job_location,
-        &fixture.anchor_locations,
     );
     let overlap = territory_overlap_ratio(&solution, &fixture.home_vehicle);
     eprintln!("=== territory_scales_to_many_drivers ===");
@@ -542,8 +520,6 @@ fn territory_scales_to_many_drivers() {
             &fixture.vehicle_ids,
             &BalancePeriodMetric::ProductionValue,
             &fixture.job_value,
-            &fixture.job_location,
-            &fixture.anchor_locations,
             0.25
         ),
         "a driver was >25% off its quota share: totals={totals:?}"

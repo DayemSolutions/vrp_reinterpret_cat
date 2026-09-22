@@ -15,6 +15,7 @@ mod territory_test;
 
 use super::vehicle_distance::get_job_location;
 use super::*;
+use crate::construction::enablers::{TotalDistanceTourState, TotalDurationTourState};
 use crate::models::problem::{JobIdDimension, driver_key};
 use std::collections::HashMap;
 
@@ -686,10 +687,27 @@ impl TerritoryShared {
             .collect()
     }
 
-    /// The balance metric total for a single route: the sum of `job_metric` across its jobs.
-    /// Shared between `loads` (solution-wide) and the per-route `TerritoryRouteLoad` cache.
+    /// The balance quantity for a single route. Shared between `loads` (solution-wide) and the
+    /// per-route `TerritoryRouteLoad` cache.
+    ///
+    /// `Activities` and `ProductionValue` are sums over the route's jobs, so they stay per-job
+    /// sums — a stop is a stop wherever it sits in the tour. `Distance` and `Duration` are
+    /// properties of the ROUTE: travel depends on the order the stops are visited, so no per-job
+    /// term can express it, and the anchor-proximity proxy this used to sum was blind to the very
+    /// thing it claimed to measure (two hours of driving between two ten-minute jobs read as two
+    /// short hops). Both are read from the state the transport feature already maintains —
+    /// `get_total_duration()` is the span the vehicle is PAID for, under its own `RouteCostSpan`,
+    /// and `get_total_distance()` is the whole route, because miles are vehicle cost and are
+    /// incurred on the commute legs whoever is on the clock for them.
     fn route_load(&self, route_ctx: &RouteContext) -> Float {
-        route_ctx.route().tour.jobs().map(|j| self.job_metric(j)).sum()
+        match self.balance {
+            None => 0.0,
+            Some(TerritoryBalance::Activities) | Some(TerritoryBalance::ProductionValue) => {
+                route_ctx.route().tour.jobs().map(|j| self.job_metric(j)).sum()
+            }
+            Some(TerritoryBalance::Distance) => route_ctx.state().get_total_distance().copied().unwrap_or(0.0),
+            Some(TerritoryBalance::Duration) => route_ctx.state().get_total_duration().copied().unwrap_or(0.0),
+        }
     }
 
     /// Current per-driver load: the sum of the balance metric across all jobs on that driver's
