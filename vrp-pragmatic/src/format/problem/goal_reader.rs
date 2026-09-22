@@ -334,7 +334,17 @@ fn get_objective_feature_layer(
             .set_compatibility_fn(territory_compatibility_fn())
             .build(),
         Objective::HierarchicalAreas { levels } => get_hierarchical_areas_feature(blocks, *levels),
-        Objective::Territory { proximity, balance, balance_tolerance, anchors, weights, allow_idle_drivers, quota } => {
+        Objective::Territory {
+            proximity,
+            balance,
+            balance_tolerance,
+            anchors,
+            weights,
+            allow_idle_drivers,
+            quota,
+            shares,
+            pools,
+        } => {
             let proximity = to_core_proximity(*proximity);
             let balance = balance.clone().map(to_core_balance);
             // The caller owns the territory: anchors are taken as given and never derived here. An
@@ -358,6 +368,10 @@ fn get_objective_feature_layer(
                 .set_weights(weights)
                 // Omitted `quota` ⇒ an empty map ⇒ the derived quota, unchanged.
                 .set_quotas(quota.clone().unwrap_or_default())
+                // `shares` is the route-level alternative: present, it replaces both. `pools` only
+                // means anything beside it, and an absent pool is the one shared default.
+                .set_quota_shares(shares.clone().unwrap_or_default())
+                .set_quota_pools(pools.clone().unwrap_or_default())
                 .set_allow_idle_drivers(*allow_idle_drivers)
                 .set_job_value_fn(|job| job.dimens().get_production_value().copied().unwrap_or(0.))
                 .set_compatibility_fn(territory_compatibility_fn())

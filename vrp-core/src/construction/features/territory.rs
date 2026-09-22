@@ -23,6 +23,7 @@ pub use crate::construction::features::vehicle_distance::ActorJobCompatibilityFn
 
 custom_solution_state!(TerritoryFitness typeof TerritoryFitnessData);
 custom_tour_state!(TerritoryRouteLoad typeof Float);
+custom_tour_state!(TerritoryRouteQuota typeof Float);
 
 /// Restores the quadratic term's weight in the regime the feature's own tests exercise.
 /// `surplus²/quota` alone is below `surplus` for every surplus under quota — at a surplus of a
@@ -134,6 +135,8 @@ pub struct TerritoryFeatureBuilder {
     anchors: HashMap<DriverKey, Vec<Location>>,
     weights: HashMap<DriverKey, Float>,
     quotas: HashMap<DriverKey, Float>,
+    quota_shares: HashMap<DriverKey, Float>,
+    quota_pools: HashMap<DriverKey, String>,
     job_value_fn: Option<JobValueFn>,
     allow_idle_drivers: bool,
 }
@@ -153,6 +156,8 @@ impl TerritoryFeatureBuilder {
             anchors: HashMap::new(),
             weights: HashMap::new(),
             quotas: HashMap::new(),
+            quota_shares: HashMap::new(),
+            quota_pools: HashMap::new(),
             job_value_fn: None,
             allow_idle_drivers: false,
         }
@@ -267,6 +272,36 @@ impl TerritoryFeatureBuilder {
         self
     }
 
+    /// Sets per-driver quota SHARES, keyed like `anchors` and `quota`, to be read together with
+    /// the pool each driver competes in ([`Self::set_quota_pools`]). A share is the fraction of its
+    /// pool's load that driver is expected to carry, and the shares inside one pool sum to 1.0.
+    ///
+    /// This is how a ROUTE-level balance metric gets a quota at all. `Distance` and `Duration` are
+    /// properties of a route, so the problem holds no total to split before the solve: only the
+    /// caller knows the ratio — capacity, and which work each driver may actually reach — and only
+    /// a solution knows the level. A non-empty map therefore replaces both a supplied `quota` and
+    /// the derived one.
+    ///
+    /// Same three edge cases as [`Self::set_quotas`]: a key matching no driver is ignored, a fleet
+    /// driver absent from a non-empty map is left out of the balance entirely, and the whole thing
+    /// is ignored when balance is `None`.
+    pub fn set_quota_shares(mut self, shares: HashMap<String, Float>) -> Self {
+        self.quota_shares = shares;
+        self
+    }
+
+    /// Sets the pool each driver's share is measured inside: the drivers it competes with for the
+    /// same work. A driver the caller did not place falls into one shared default pool, which is
+    /// the right answer when no hard gate splits the fleet.
+    ///
+    /// Pools are what keep the share gate-aware. A driver a service area keeps off half the ground
+    /// must be quoted against the half it can reach, not against the whole chunk — the failure
+    /// otherwise is a deficit that never closes.
+    pub fn set_quota_pools(mut self, pools: HashMap<String, String>) -> Self {
+        self.quota_pools = pools;
+        self
+    }
+
     /// When `true`, drivers that end up with no jobs are left out of the balance entirely (quotas
     /// are re-based over the drivers actually used), so leaving a driver idle is allowed rather than
     /// treated as a deficit. Defaults to `false` (balance spans every driver).
@@ -295,6 +330,8 @@ impl TerritoryFeatureBuilder {
             self.anchors,
             self.weights,
             self.quotas,
+            self.quota_shares,
+            self.quota_pools,
             job_value_fn,
             self.allow_idle_drivers,
         ));
@@ -335,6 +372,13 @@ struct TerritoryShared {
     /// proportional to each driver's available time window. Empty when `balance` is `None`
     /// (unlimited spare capacity).
     quotas: HashMap<DriverKey, Float>,
+    /// Per-driver quota shares and the pool each is measured in — the route-level alternative to
+    /// [`Self::quotas`]. See [`TerritoryFeatureBuilder::set_quota_shares`].
+    quota_shares: HashMap<DriverKey, Float>,
+    quota_pools: HashMap<DriverKey, String>,
+    /// True when [`Self::quota_shares`] came from the caller. Shares outrank quotas: a caller that
+    /// sent both means the ratio, and a level it could not know.
+    shares_supplied: bool,
     /// True when [`Self::quotas`] came from the caller instead of [`Self::compute_quotas`].
     /// Supplied quotas are already the intended targets, so they are never re-based (see
     /// [`Self::effective_quotas`]).
@@ -401,11 +445,14 @@ impl TerritoryShared {
         anchors: HashMap<DriverKey, Vec<Location>>,
         weights: HashMap<DriverKey, Float>,
         supplied_quotas: HashMap<DriverKey, Float>,
+        supplied_shares: HashMap<DriverKey, Float>,
+        quota_pools: HashMap<DriverKey, String>,
         job_value_fn: JobValueFn,
         allow_idle_drivers: bool,
     ) -> Self {
         let profile = actors.first().map(|a| a.vehicle.profile.clone()).unwrap_or_default();
         // Quotas are meaningless without a balance metric, so that mode keeps deriving nothing.
+        let shares_supplied = balance.is_some() && !supplied_shares.is_empty();
         let quotas_supplied = balance.is_some() && !supplied_quotas.is_empty();
         let mut shared = Self {
             transport,
@@ -419,6 +466,9 @@ impl TerritoryShared {
             anchors,
             weights,
             quotas: HashMap::new(),
+            quota_shares: HashMap::new(),
+            quota_pools,
+            shares_supplied,
             quotas_supplied,
             reference: 1.0,
             job_anchor_ranking: HashMap::new(),
@@ -440,10 +490,18 @@ impl TerritoryShared {
         shared.push_reach = shared.compute_push_reach();
         shared.caps = shared.compute_caps();
         shared.driver_order = sorted_driver_keys(&shared.caps);
-        // `filter_supplied_quotas` reads `caps` to tell a real driver from an unknown key, so it
+        // `filter_supplied_quotas` reads `caps` to tell a real driver from an unknown key, so both
         // must run after it.
-        shared.quotas =
-            if quotas_supplied { shared.filter_supplied_quotas(supplied_quotas) } else { shared.compute_quotas(&jobs) };
+        shared.quota_shares = shared.filter_supplied_quotas(supplied_shares);
+        shared.quotas = if shares_supplied {
+            // Shares replace the amount entirely: the level is read off each solution, so there is
+            // no static quota to hold. `effective_quotas` is where it appears.
+            HashMap::new()
+        } else if quotas_supplied {
+            shared.filter_supplied_quotas(supplied_quotas)
+        } else {
+            shared.compute_quotas(&jobs)
+        };
         shared.reference = shared.compute_reference(&jobs).max(1.0);
         shared
     }
@@ -528,6 +586,10 @@ impl TerritoryShared {
     ///   idle drivers carry no quota and never count as a deficit, while the used drivers stay
     ///   balanced among themselves.
     fn effective_quotas(&self, loads: &HashMap<DriverKey, Float>) -> HashMap<DriverKey, Float> {
+        if self.shares_supplied {
+            return self.quotas_from_shares(loads);
+        }
+
         if !self.allow_idle_drivers || self.quotas_supplied {
             return self.quotas.clone();
         }
@@ -542,6 +604,57 @@ impl TerritoryShared {
         let used_cap: Float = used.iter().filter_map(|k| self.caps.get(*k)).sum::<Float>().max(1e-6);
         let used_load: Float = used.iter().filter_map(|k| loads.get(*k)).sum();
         used.into_iter().map(|k| (k.clone(), used_load * self.caps.get(k).copied().unwrap_or(0.0) / used_cap)).collect()
+    }
+
+    /// Quotas built from the caller's shares: the ratio is theirs, the level is this solution's.
+    ///
+    /// Per pool, the quota is `share_e x (the pool's own total load)`. That keeps the two quota
+    /// invariants a supplied map has to satisfy — every participating driver holds a key, and the
+    /// quotas of a pool sum to exactly that pool's total, so a deficit always exists somewhere
+    /// while anybody is over the band.
+    ///
+    /// The target therefore moves with the solution, which is the point rather than a compromise:
+    /// balance is a dispersion measure and should be level-invariant. The level belongs to the
+    /// transport objective, and pinning it to a pre-solve estimate would either silence PUSH (an
+    /// estimate above the truth) or bill everybody at once (one below it, which is what any
+    /// lower-bound estimate of travel is).
+    ///
+    /// Walked in `driver_order` so both sums fold in a fixed order — a float sum rounds by the
+    /// order it is folded in, and every quota is scaled by these totals.
+    fn quotas_from_shares(&self, loads: &HashMap<DriverKey, Float>) -> HashMap<DriverKey, Float> {
+        let mut pool_load: HashMap<&str, Float> = HashMap::new();
+
+        for key in self.driver_order.iter() {
+            if !self.quota_shares.contains_key(key) {
+                continue;
+            }
+            *pool_load.entry(self.pool_of(key)).or_insert(0.0) += loads.get(key).copied().unwrap_or(0.0);
+        }
+
+        self.driver_order
+            .iter()
+            .filter_map(|key| {
+                let share = self.quota_shares.get(key)?;
+                Some((key.clone(), share * pool_load.get(self.pool_of(key)).copied().unwrap_or(0.0)))
+            })
+            .collect()
+    }
+
+    /// The pool a driver competes in. Drivers the caller did not place share one default pool,
+    /// which is the whole fleet when no hard gate splits it.
+    fn pool_of(&self, key: &DriverKey) -> &str {
+        self.quota_pools.get(key).map(String::as_str).unwrap_or("")
+    }
+
+    /// Every driver taking part in the balance, whichever way its quota is expressed.
+    fn quota_keys(&self) -> impl Iterator<Item = &DriverKey> {
+        let (shares, quotas) = if self.shares_supplied {
+            (Some(self.quota_shares.keys()), None)
+        } else {
+            (None, Some(self.quotas.keys()))
+        };
+
+        shares.into_iter().flatten().chain(quotas.into_iter().flatten())
     }
 
     /// The self-normalization reference: the sum, over all jobs, of the proximity to each job's
@@ -761,7 +874,7 @@ impl TerritoryShared {
     /// Current per-driver load: the sum of the balance metric across all jobs on that driver's
     /// route(s) in the given solution. Includes every driver with a quota, even if idle.
     fn loads(&self, solution: &SolutionContext) -> HashMap<DriverKey, Float> {
-        let mut loads: HashMap<DriverKey, Float> = self.quotas.keys().map(|k| (k.clone(), 0.0)).collect();
+        let mut loads: HashMap<DriverKey, Float> = self.quota_keys().map(|k| (k.clone(), 0.0)).collect();
         for route_ctx in solution.routes.iter() {
             let key = driver_key(&route_ctx.route().actor);
             *loads.entry(key).or_insert(0.0) += self.route_load(route_ctx);
@@ -805,7 +918,7 @@ impl TerritoryShared {
     /// terms are jobs × metres and [`PUSH_CONVEXITY_GAIN`] means the same thing whatever the metric
     /// is measured in.
     fn push(&self, solution: &SolutionContext) -> Cost {
-        if self.balance.is_none() || self.quotas.is_empty() {
+        if self.balance.is_none() || (self.quotas.is_empty() && self.quota_shares.is_empty()) {
             return 0.0;
         }
         let loads = self.loads(solution);
@@ -915,15 +1028,30 @@ impl TerritoryShared {
             return 0.0;
         };
         let load = route_ctx.state().get_territory_route_load().copied().unwrap_or(0.0);
-        // `load` is this route alone; the quota spans the driver's whole horizon. Scale it to this
-        // route's share of the driver's capacity so both sides are one route's worth of work.
-        let Some(&driver_quota) = self.quotas.get(&key) else { return 0.0 };
-        let driver_capacity = self.caps.get(&key).copied().unwrap_or(0.0);
-        if driver_capacity <= 0.0 {
+        // This route's own slice of its driver's quota: `load` is one route while a quota spans the
+        // driver's whole horizon, so the two have to be brought onto the same scale.
+        //
+        // Cached by `cache_route_quotas` where a solution exists. It does not yet during the first
+        // construction — `accept_insertion` refreshes a route's load but cannot know solution-wide
+        // loads — so a static quota falls back to scaling itself here, exactly as it always did.
+        // Supplied SHARES have no static quota to fall back to, and that is correct rather than a
+        // gap: their level is a property of a solution, and before one exists there is no imbalance
+        // to price.
+        let route_capacity = (actor.detail.time.end - actor.detail.time.start).max(0.0);
+        let route_quota = match route_ctx.state().get_territory_route_quota().copied() {
+            Some(cached) => cached,
+            None => {
+                let Some(&driver_quota) = self.quotas.get(&key) else { return 0.0 };
+                let driver_capacity = self.caps.get(&key).copied().unwrap_or(0.0);
+                if driver_capacity <= 0.0 {
+                    return 0.0;
+                }
+                driver_quota * route_capacity / driver_capacity
+            }
+        };
+        if route_quota <= 0.0 {
             return 0.0;
         }
-        let route_capacity = (actor.detail.time.end - actor.detail.time.start).max(0.0);
-        let route_quota = driver_quota * route_capacity / driver_capacity;
         // Deadband: no shedding pressure until the route is over the widened quota.
         if load <= self.over_quota(route_quota) {
             return 0.0;
@@ -1008,11 +1136,38 @@ impl FeatureState for TerritoryState {
 
     fn accept_solution_state(&self, solution_ctx: &mut SolutionContext) {
         solution_ctx.routes.iter_mut().for_each(|route_ctx| self.accept_route_state(route_ctx));
+        self.cache_route_quotas(solution_ctx);
         self.recompute(solution_ctx);
     }
 }
 
 impl TerritoryState {
+    /// Writes each route's own slice of its driver's quota into the route state.
+    ///
+    /// `push_marginal` runs during insertion with only a `RouteContext` in hand. Under supplied
+    /// shares the driver's quota does not exist until a solution supplies the level, and even under
+    /// a static quota the route's slice had to be recomputed on every estimate. Caching it here —
+    /// the one place that already walks every route, after their loads are refreshed — makes the
+    /// marginal a route-local read and puts the scaling in a single place.
+    fn cache_route_quotas(&self, solution_ctx: &mut SolutionContext) {
+        let loads = self.shared.loads(solution_ctx);
+        let quotas = self.shared.effective_quotas(&loads);
+
+        for route_ctx in solution_ctx.routes.iter_mut() {
+            let actor = &route_ctx.route().actor;
+            let key = driver_key(actor);
+            let driver_capacity = self.shared.caps.get(&key).copied().unwrap_or(0.0);
+            let route_capacity = (actor.detail.time.end - actor.detail.time.start).max(0.0);
+
+            let route_quota = match quotas.get(&key) {
+                Some(&driver_quota) if driver_capacity > 0.0 => driver_quota * route_capacity / driver_capacity,
+                _ => 0.0,
+            };
+
+            route_ctx.state_mut().set_territory_route_quota(route_quota);
+        }
+    }
+
     fn recompute(&self, solution_ctx: &mut SolutionContext) {
         let pull = self.shared.pull(solution_ctx);
         let push = self.shared.push(solution_ctx);

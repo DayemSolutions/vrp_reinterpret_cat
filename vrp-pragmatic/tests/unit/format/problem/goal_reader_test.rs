@@ -31,6 +31,8 @@ fn builds_goal_with_territory_objective() {
                 weights: None,
                 allow_idle_drivers: false,
                 quota: None,
+                shares: None,
+                pools: None,
             },
             Objective::MinimizeCost,
         ]),
@@ -74,6 +76,8 @@ fn refuses_goal_with_territory_objective_when_anchors_are_empty() {
                 weights: None,
                 allow_idle_drivers: false,
                 quota: None,
+                shares: None,
+                pools: None,
             },
             Objective::MinimizeCost,
         ]),
@@ -89,4 +93,29 @@ fn refuses_goal_with_territory_objective_when_anchors_are_empty() {
         errors.errors.iter().any(|err| err.code == "E1610"),
         "expected E1610 among the reported errors, got: {errors}"
     );
+}
+
+/// Both new keys are single words, so their snake_case and camelCase spellings coincide and
+/// neither needs a serde `alias` — the trap `balance_tolerance` and `allow_idle_drivers` carry.
+/// This pins that they survive a round trip through the wire rather than being silently dropped.
+#[test]
+fn territory_objective_reads_quota_shares_and_pools() {
+    let json = r#"{
+        "type": "territory",
+        "proximity": "distance",
+        "balance": "duration",
+        "anchors": { "d1": [1], "d2": [2] },
+        "shares": { "d1": 0.6, "d2": 0.4 },
+        "pools": { "d1": "north", "d2": "north" }
+    }"#;
+
+    match serde_json::from_str::<Objective>(json).unwrap() {
+        Objective::Territory { shares: Some(shares), pools: Some(pools), quota: None, .. } => {
+            assert_eq!(shares.get("d1").copied(), Some(0.6));
+            assert_eq!(shares.get("d2").copied(), Some(0.4));
+            assert_eq!(pools.get("d1").map(String::as_str), Some("north"));
+            assert_eq!(pools.get("d2").map(String::as_str), Some("north"));
+        }
+        other => unreachable!("expected a territory objective carrying shares and pools, got {other:?}"),
+    }
 }
