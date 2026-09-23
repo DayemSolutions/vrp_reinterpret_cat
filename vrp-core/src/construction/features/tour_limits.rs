@@ -264,24 +264,34 @@ impl TravelLimitConstraint {
     }
 
     /// Whether the travel delta misses a part of what this insertion does to the tour's *measured*
-    /// duration — not to what fills the tour, but to where the measurement starts.
+    /// duration — not to what fills the tour, but to where the measurement starts or ends.
     ///
-    /// `calculate_travel_delta` prices legs; it knows nothing of the shift's `RouteCostSpan`. A
-    /// `FirstJobTo*` span is measured from the first job's arrival (`calculate_route_duration`), and
-    /// an insertion in front of the first job moves that anchor earlier — by the whole difference
-    /// between the two depot legs, which the delta never reports. The tour can then run hours longer
-    /// than the delta says while the limit reads it as having room to spare.
+    /// `calculate_travel_delta` prices legs; it knows nothing of the shift's `RouteCostSpan`. Both
+    /// anchors a span can put on a job move under an insertion, and the delta reports neither:
+    ///
+    /// - A `FirstJobTo*` span is measured from the first job's arrival
+    ///   (`calculate_route_duration`), and an insertion in front of the first job moves that anchor
+    ///   earlier — by the whole difference between the two depot legs.
+    /// - A `*ToLastJob` span is measured to the last job's departure, and an append moves that
+    ///   anchor later — by the travel out to the new job plus its service. What the delta prices
+    ///   instead is the drive home, which the new last job can make SHORTER than the old one's: a
+    ///   job on the way back reads as free, or as a saving, while the tour it closes runs hours
+    ///   longer. `FirstJobToLastJob`, which production runs on, has both ends exposed.
     ///
     /// This needs no reserved time to go wrong, so both paths consult it: the walk handles the moved
     /// anchor (`replay_tail`), the delta cannot, and the dominance guard has no bound to stand on
-    /// while it holds. It is asked index-first so that a shift which is not in this case pays one
-    /// integer comparison per position and reads the span on the single leg at index 0.
+    /// while it holds. An append replays two activities, so the cost is bounded by where the anchor
+    /// sits rather than by the length of the tour.
     fn is_delta_blind_to_span(&self, route_ctx: &RouteContext, activity_ctx: &ActivityContext) -> bool {
-        activity_ctx.index == 0
-            && matches!(
-                route_ctx.route().actor.vehicle.dimens.get_route_cost_span().copied().unwrap_or_default(),
-                RouteCostSpan::FirstJobToDepot | RouteCostSpan::FirstJobToLastJob
-            )
+        let span = route_ctx.route().actor.vehicle.dimens.get_route_cost_span().copied().unwrap_or_default();
+
+        let moves_first_job = activity_ctx.index == 0
+            && matches!(span, RouteCostSpan::FirstJobToDepot | RouteCostSpan::FirstJobToLastJob);
+        // the target becomes the last job when nothing but the end depot follows it
+        let moves_last_job = activity_ctx.next.is_none_or(|next| next.job.is_none())
+            && matches!(span, RouteCostSpan::DepotToLastJob | RouteCostSpan::FirstJobToLastJob);
+
+        moves_first_job || moves_last_job
     }
 
     /// Replays the tour behind the insertion point to get the duration the route would really have.
