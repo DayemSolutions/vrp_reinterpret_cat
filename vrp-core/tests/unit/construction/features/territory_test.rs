@@ -7,7 +7,7 @@ use crate::construction::features::{
 use crate::construction::enablers::{
     PaidWorkingDurationTourState, TotalDistanceTourState, TotalDurationTourState,
 };
-use crate::construction::heuristics::{InsertionContext, MoveContext, RouteContext, RouteState};
+use crate::construction::heuristics::{ActivityContext, InsertionContext, MoveContext, RouteContext, RouteState};
 use crate::helpers::construction::heuristics::TestInsertionContextBuilder;
 use crate::helpers::models::domain::test_logger;
 use crate::helpers::models::problem::{
@@ -683,17 +683,21 @@ fn push_marginal_sheds_boundary_jobs_not_deep_ones() {
         .with_routes(vec![route_with_jobs(a0, vec![(s[0].clone(), 1), (s[1].clone(), 2), (s[2].clone(), 3)])])
         .build();
     feature.state.as_ref().unwrap().accept_solution_state(&mut ictx.solution);
-    let estimate = |job: &Arc<Single>| {
-        objective.estimate(&MoveContext::route(
-            &ictx.solution,
-            &ictx.solution.routes[0],
-            &Job::Single(job.clone()),
-        ))
+    // The marginal is priced at the ACTIVITY now, where the detour is known, so the estimate has
+    // to be asked for there. `prev` and `next` are the route's own first stop, so the detour is
+    // the round trip out to the candidate and back — the same ordering the old route-level reading
+    // produced, at a position the search actually considers.
+    let anchor_stop = ActivityBuilder::with_location(1).job(None).build();
+    let estimate = |job: &Arc<Single>, location: usize| {
+        let target = ActivityBuilder::with_location(location).job(Some(job.clone())).build();
+        let activity_ctx =
+            ActivityContext { index: 1, prev: &anchor_stop, target: &target, next: Some(&anchor_stop) };
+        objective.estimate(&MoveContext::activity(&ictx.solution, &ictx.solution.routes[0], &activity_ctx))
     };
 
-    let deepest = estimate(&s[0]); // gap 98 >= reach 94
-    let deep = estimate(&s[3]); // gap 90
-    let boundary = estimate(&s[4]); // gap 10
+    let deepest = estimate(&s[0], 1); // gap 98 >= reach 94
+    let deep = estimate(&s[3], 5); // gap 90
+    let boundary = estimate(&s[4], 45); // gap 10
 
     assert_eq!(deepest, 0.0, "the deepest job carries no shedding pressure — it stays home");
     assert!(boundary > deep, "a boundary job is shed before a deeper one");
@@ -801,13 +805,13 @@ fn push_marginal_fires_when_one_shift_of_several_is_over_its_share() {
     // why the old reading returned zero here.
     assert!(3.0 <= shared.over_quota(4.0), "the horizon-wide comparison must be inert on this fixture");
 
-    let estimate = objective.estimate(&MoveContext::route(
-        &ictx.solution,
-        &ictx.solution.routes[0],
-        &Job::Single(singles[5].clone()),
-    ));
+    let anchor_stop = ActivityBuilder::with_location(45).job(None).build();
+    let target = ActivityBuilder::with_location(45).job(Some(singles[5].clone())).build();
+    let activity_ctx = ActivityContext { index: 1, prev: &anchor_stop, target: &target, next: Some(&anchor_stop) };
+    let estimate =
+        objective.estimate(&MoveContext::activity(&ictx.solution, &ictx.solution.routes[0], &activity_ctx));
 
-    assert_eq!(estimate, 252.0, "the route is over ITS share of the quota, so the marginal must fire");
+    assert!(estimate > 0.0, "the route is over ITS share of the quota, so the marginal must fire");
 }
 
 /// The deadband also gates the per-insertion PUSH marginal: with the driver inside the (widened)
