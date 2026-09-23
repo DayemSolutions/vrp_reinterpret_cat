@@ -35,10 +35,11 @@ fn check_shift_limits(context: &CheckerContext) -> GenericResult<()> {
                 }
 
             if let Some(max_duration) = limits.max_duration
-                && tour.statistic.duration as Float > max_duration {
+                && let Some(duration) = paid_duration(tour, vehicle)
+                && duration > max_duration {
                     return Err(format!(
                         "shift time limit violation, expected: not more than {}, got: {}, vehicle id '{}', shift index: {}",
-                        max_duration, tour.statistic.duration, tour.vehicle_id, tour.shift_index
+                        max_duration, duration, tour.vehicle_id, tour.shift_index
                     ).into());
                 }
 
@@ -63,6 +64,41 @@ fn check_shift_limits(context: &CheckerContext) -> GenericResult<()> {
         }
 
         Ok(())
+    })
+}
+
+/// The stretch of the tour the vehicle is paid for, which is the stretch `maxDuration` caps.
+///
+/// `tour.statistic.duration` is always the round trip — the solution writer says so where it
+/// builds it — while the solver enforces the cap over the shift's `costs.span`
+/// (`calculate_route_duration` in vrp-core). Read the round trip against a span-trimmed cap and
+/// every tour whose commute legs push it past the cap is reported as broken: 865 of 6382 tours on
+/// one production month, all but five of them inside their cap on the stretch they are paid for.
+/// None of the 865 is something an operator can act on, and the first one ends the check — this
+/// function is what stops a real violation from hiding behind them.
+///
+/// First and last job are the first and last STOP, the same reading the tour size check above
+/// takes: a break, a reload or a recharge is not a visit, and the paid span runs between customers.
+/// A tour with no stop at all has nothing to measure and is left to `check_shift_time`.
+fn paid_duration(tour: &Tour, vehicle: &VehicleType) -> Option<Float> {
+    let (start, end) = tour.stops.first().zip(tour.stops.last())?;
+
+    let start_departure = parse_time(&start.schedule().departure);
+    let end_departure = parse_time(&end.schedule().departure);
+
+    let is_visit = |stop: &&Stop| stop.activities().iter().any(is_stop_activity);
+    let first_arrival = tour.stops.iter().find(is_visit).map(|stop| parse_time(&stop.schedule().arrival));
+    let last_departure = tour.stops.iter().rev().find(is_visit).map(|stop| parse_time(&stop.schedule().departure));
+
+    // mirrors `calculate_route_duration`: a tour that visits nobody is charged for nothing, and
+    // only the round trip is measurable without a visit to anchor it
+    Some(match vehicle.costs.span.clone().unwrap_or_default() {
+        RouteCostSpan::DepotToDepot => end_departure - start_departure,
+        RouteCostSpan::DepotToLastJob => last_departure.map_or_else(Duration::default, |last| last - start_departure),
+        RouteCostSpan::FirstJobToDepot => first_arrival.map_or_else(Duration::default, |first| end_departure - first),
+        RouteCostSpan::FirstJobToLastJob => {
+            first_arrival.zip(last_departure).map_or_else(Duration::default, |(first, last)| last - first)
+        }
     })
 }
 

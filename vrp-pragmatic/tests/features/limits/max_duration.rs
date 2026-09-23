@@ -15,6 +15,36 @@ fn create_vehicle_type_with_max_duration_limit(max_duration: Float) -> VehicleTy
     }
 }
 
+/// `maxDuration` caps the time the shift is PAID for, and `costs.span` says which stretch of the
+/// tour that is. So a tour can sit well inside its cap and still run far longer door to door: the
+/// commute here is 100s at each end and the work between the two jobs is 12s, against a cap of 100.
+///
+/// The solver places both jobs, and `solve_with_metaheuristic` runs the solution through the
+/// checker — which is the point of doing this end to end. The checker read `statistic.duration`,
+/// always the round trip, and called this tour broken at 212 against a cap the solver had honoured.
+#[test]
+fn can_solve_and_check_a_tour_whose_commute_exceeds_a_span_trimmed_cap() {
+    let mut vehicle = create_vehicle_type_with_max_duration_limit(100.);
+    vehicle.costs.span = Some(RouteCostSpan::FirstJobToLastJob);
+
+    let problem = Problem {
+        plan: Plan {
+            jobs: vec![create_delivery_job("job1", (100., 0.)), create_delivery_job("job2", (100., 10.))],
+            ..create_empty_plan()
+        },
+        fleet: Fleet { vehicles: vec![vehicle], ..create_default_fleet() },
+        ..create_empty_problem()
+    };
+    let matrix = create_matrix_from_problem(&problem);
+
+    let solution = solve_with_metaheuristic(problem, Some(vec![matrix]));
+
+    assert!(solution.unassigned.is_none());
+    assert_eq!(solution.tours.len(), 1);
+    // the round trip is what the checker used to read, and it is nowhere near the cap
+    assert!(solution.tours[0].statistic.duration > 100, "expect a tour whose commute breaks the cap");
+}
+
 #[test]
 fn can_limit_one_job_by_max_duration() {
     let problem = Problem {
