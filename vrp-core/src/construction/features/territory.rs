@@ -22,6 +22,7 @@ use std::collections::HashMap;
 pub use crate::construction::features::vehicle_distance::ActorJobCompatibilityFn;
 
 custom_solution_state!(TerritoryFitness typeof TerritoryFitnessData);
+custom_solution_state!(TerritoryAvgLoad typeof Float);
 custom_tour_state!(TerritoryRouteLoad typeof Float);
 custom_tour_state!(TerritoryRouteQuota typeof Float);
 
@@ -1088,7 +1089,22 @@ impl TerritoryShared {
     /// is — rather than a flat step. Note the version before the convex fitness already read as a
     /// derivative without being one: it was off by the factor of 2, and carried no gain at all, so
     /// the estimate steered construction on a weaker price than the fitness it approximates.
-    fn push_marginal(&self, route_ctx: &RouteContext, job: &Job) -> Cost {
+    /// The shedding pressure one INSERTION carries, priced where the position is known.
+    ///
+    /// ⚠️ Evaluated at the activity, not at the route. What an insertion adds to a route's load is
+    /// its service plus a DETOUR between two neighbours — not the job's standalone round trip from
+    /// a depot, which is several times larger, and which discriminates by distance-from-depot
+    /// rather than by distance-from-this-route. A technician whose whole territory sits far from
+    /// the depot saw every job as expensive under that reading.
+    ///
+    /// The detour is what `estimate_leg` already computes for the transport feature, so this
+    /// prices an insertion with the same arithmetic the plan is costed by.
+    fn push_marginal(
+        &self,
+        route_ctx: &RouteContext,
+        activity_ctx: &ActivityContext,
+        avg_load: Float,
+    ) -> Cost {
         if self.balance.is_none() {
             return 0.0;
         }
@@ -1098,26 +1114,18 @@ impl TerritoryShared {
         if self.allow_idle_drivers {
             return 0.0;
         }
+        let Some(single) = activity_ctx.target.job.as_ref() else { return 0.0 };
+        let job = Job::Single(single.clone());
         let actor = &route_ctx.route().actor;
         let key = driver_key(actor);
         let Some(assigned_anchors) = self.driver_anchors(&key) else {
             return 0.0;
         };
         let load = route_ctx.state().get_territory_route_load().copied().unwrap_or(0.0);
-        // This route's own slice of its driver's quota: `load` is one route while a quota spans the
-        // driver's whole horizon, so the two have to be brought onto the same scale.
-        //
-        // Cached by `cache_route_quotas` where a solution exists. It does not yet during the first
-        // construction — `accept_insertion` refreshes a route's load but cannot know solution-wide
-        // loads — so a static quota falls back to scaling itself here, exactly as it always did.
-        // Supplied SHARES have no static quota to fall back to, and that is correct rather than a
-        // gap: their level is a property of a solution, and before one exists there is no imbalance
-        // to price.
-        // This route's own slice of its driver's quota, cached by `cache_route_quotas` — one rule,
-        // written in one place, for both quota modes. Absent before the first solution-state pass,
-        // which reads as no shedding pressure: the slice depends on which routes the driver
-        // actually has, and before a solution exists there is no answer to that. It is also when
-        // there is nothing to shed.
+        // This route's own slice of its driver's quota, cached by `cache_route_quotas`. Absent
+        // before the first solution-state pass, which reads as no shedding pressure: the slice
+        // depends on which routes the driver actually has, and before a solution exists there is
+        // no answer to that.
         let route_quota = route_ctx.state().get_territory_route_quota().copied().unwrap_or(0.0);
         if route_quota <= 0.0 {
             return 0.0;
@@ -1126,26 +1134,78 @@ impl TerritoryShared {
         if load <= self.over_quota(route_quota) {
             return 0.0;
         }
-        let Some(loc) = get_job_location(job) else { return 0.0 };
+        let loc = activity_ctx.target.place.location;
 
         // gap = (nearest power among OTHER drivers) − (this driver's power for the job). Large gap ⇒
         // this driver is much the better home ⇒ the job is deep in its cell; small/negative ⇒ it is
-        // a boundary/foreign job with a cheap alternative. `nearest_power` is the min over ALL
-        // compatible anchors; when this driver *is* that min, the nearest other is the second power.
+        // a boundary/foreign job with a cheap alternative.
         let assigned_power = self.min_prox_to(assigned_anchors, loc) - self.weight(&key);
-        let reference = self.nearest_power(loc, job);
+        let reference = self.nearest_power(loc, &job);
         let min_other = if assigned_power <= reference + 1e-9 {
-            job.dimens().get_job_id().and_then(|id| self.job_second_power.get(id)).copied().unwrap_or(Float::INFINITY)
+            single.dimens.get_job_id().and_then(|id| self.job_second_power.get(id)).copied().unwrap_or(Float::INFINITY)
         } else {
             reference
         };
         let gap = min_other - assigned_power;
-        let value_factor = self.insertion_metric(job) / self.avg_metric;
+        let value_factor = self.insertion_delta(activity_ctx) / avg_load;
         // Derivative of the convex PUSH, `2 · GAIN · surplus / quota`: the price rises with how far
         // over the band this route sits, so a flat step is replaced by pressure that grows with the
         // imbalance it prices — on the same scale as the fitness rather than a fraction of it.
         let surplus_ratio = (load - self.over_quota(route_quota)) / route_quota.max(1e-9);
         value_factor * 2.0 * PUSH_CONVEXITY_GAIN * surplus_ratio * (self.push_reach - gap).max(0.0)
+    }
+
+    /// The travel this insertion adds between its two neighbours:
+    /// `prev -> target -> next` less the `prev -> next` it replaces. Zero at an open end, where
+    /// nothing is replaced.
+    ///
+    /// Measured with the approximate lookups, as [`Self::proximity`] is — an estimate does not
+    /// need the routed, departure-time-dependent figure the transport feature computes, and paying
+    /// for it once per candidate position would be the most expensive thing in the search.
+    fn detour(&self, activity_ctx: &ActivityContext, as_duration: bool) -> Float {
+        let travel = |from: Location, to: Location| {
+            if as_duration {
+                self.transport.duration_approx(&self.profile, from, to)
+            } else {
+                self.transport.distance_approx(&self.profile, from, to)
+            }
+        };
+
+        let prev = activity_ctx.prev.place.location;
+        let target = activity_ctx.target.place.location;
+
+        match activity_ctx.next {
+            Some(next) => {
+                let next = next.place.location;
+                (travel(prev, target) + travel(target, next) - travel(prev, next)).max(0.0)
+            }
+            None => travel(prev, target),
+        }
+    }
+
+    /// What this insertion adds to the route's balance load, at this position.
+    ///
+    /// The counterpart of [`Self::route_load`], one insertion at a time: the same quantity the
+    /// fitness measures, which is what `.ai/rules/solver.md` means by an estimate agreeing with its
+    /// fitness in quantity, unit and aggregation level.
+    fn insertion_delta(&self, activity_ctx: &ActivityContext) -> Float {
+        let service = activity_ctx.target.place.duration;
+
+        match self.balance {
+            None => 0.0,
+            Some(TerritoryBalance::Activities) => 1.0,
+            Some(TerritoryBalance::Service) => service,
+            Some(TerritoryBalance::ProductionValue) => activity_ctx
+                .target
+                .job
+                .as_ref()
+                .map(|single| (self.job_value_fn)(&Job::Single(single.clone())))
+                .unwrap_or(0.0),
+            Some(TerritoryBalance::Distance) => self.detour(activity_ctx, false),
+            // Service is added on top of the drive, because the paid working duration this
+            // balances is both.
+            Some(TerritoryBalance::Duration) => service + self.detour(activity_ctx, true),
+        }
     }
 }
 
@@ -1168,6 +1228,8 @@ impl FeatureObjective for TerritoryObjective {
 
     fn estimate(&self, move_ctx: &MoveContext<'_>) -> Cost {
         match move_ctx {
+            // PULL is a property of WHICH driver takes the job, not of where in their day it
+            // lands, so it is priced once per route.
             MoveContext::Route { route_ctx, job, .. } => {
                 let Some(loc) = get_job_location(job) else { return Cost::default() };
                 let actor = &route_ctx.route().actor;
@@ -1177,10 +1239,20 @@ impl FeatureObjective for TerritoryObjective {
                 };
                 let assigned_power = assigned_prox - self.shared.weight(&key);
                 let reference = self.shared.nearest_power(loc, job);
-                let pull = (assigned_power - reference).max(0.0);
-                pull + self.shared.push_marginal(route_ctx, job)
+                (assigned_power - reference).max(0.0)
             }
-            MoveContext::Activity { .. } => Cost::default(),
+            // PUSH is not: what an insertion adds to a route's load is the detour it causes, and
+            // that is only knowable once the position is.
+            MoveContext::Activity { solution_ctx, route_ctx, activity_ctx } => {
+                let avg_load = solution_ctx
+                    .state
+                    .get_territory_avg_load()
+                    .copied()
+                    .unwrap_or(self.shared.avg_metric)
+                    .max(1e-9);
+
+                self.shared.push_marginal(route_ctx, activity_ctx, avg_load)
+            }
         }
     }
 
@@ -1262,5 +1334,16 @@ impl TerritoryState {
         let pull = self.shared.pull(solution_ctx);
         let push = self.shared.push(solution_ctx);
         solution_ctx.state.set_territory_fitness(TerritoryFitnessData { pull, push });
+
+        // What one job typically contributes to a route's load, measured rather than estimated.
+        //
+        // It is the divisor that turns PUSH's surplus into "jobs' worth", and the marginal now
+        // measures a DETOUR — so the divisor has to be the same kind of quantity, or the two are
+        // on different scales and `PUSH_CONVEXITY_GAIN` stops meaning one thing. For `Activities`
+        // it is identically 1.0 and for `ProductionValue` the mean job value, so the two metrics
+        // the gain is calibrated against are unmoved.
+        let jobs: usize = solution_ctx.routes.iter().map(|route_ctx| route_ctx.route().tour.job_count()).sum();
+        let load: Float = solution_ctx.routes.iter().map(|route_ctx| self.shared.route_load(route_ctx)).sum();
+        solution_ctx.state.set_territory_avg_load(if jobs == 0 { self.shared.avg_metric } else { (load / jobs as Float).max(1e-9) });
     }
 }
