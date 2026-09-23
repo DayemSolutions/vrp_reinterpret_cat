@@ -1418,6 +1418,7 @@ fn the_duration_estimate_carries_service_time_as_well_as_travel() {
     assert_eq!(shared.job_metric(&job), 610.0);
 }
 
+
 /// `Service` levels time spent at customers and nothing else — no travel in the load, none in the
 /// estimate. It is the metric with no feedback: moving a job cannot change how long it takes.
 #[test]
@@ -1471,4 +1472,54 @@ fn shared_single(_shared: &TerritoryShared) -> Arc<Single> {
     let mut builder = TestSingleBuilder::default();
     builder.id("job_0").location(Some(5)).duration(600.0);
     builder.build_shared()
+}
+
+/// The two per-job questions are not the same question, and `Duration` answers them differently.
+///
+/// What a job is worth to the problem's TOTAL — which sizes a derived quota — is the travel to
+/// reach it plus its service. What INSERTING it into a route costs is its service plus a detour,
+/// and the detour is not the round trip this feature can see. Estimating the insertion at the round
+/// trip made every job look alike and mis-scaled the marginal against PULL.
+#[test]
+fn a_duration_job_is_worth_its_round_trip_to_the_total_and_its_service_to_a_route() {
+    let mut builder = TestSingleBuilder::default();
+    builder.id("job_0").location(Some(5)).duration(600.0);
+    let job = Job::Single(builder.build_shared());
+
+    let fleet = {
+        let mut fleet_builder = FleetBuilder::default();
+        fleet_builder.add_driver(test_driver());
+        let mut vehicle_builder = TestVehicleBuilder::default();
+        vehicle_builder.id("v_d0").details(vec![VehicleDetail {
+            start: Some(VehiclePlace { location: 0, time: TimeInterval { earliest: Some(0.0), latest: None } }),
+            end: Some(VehiclePlace { location: 0, time: TimeInterval { earliest: None, latest: Some(1000.0) } }),
+        }]);
+        vehicle_builder.dimens_mut().set_driver_id("d0".to_string());
+        fleet_builder.add_vehicle(vehicle_builder.build());
+        fleet_builder.build()
+    };
+    let actor = get_test_actor_from_fleet(&fleet, "v_d0");
+    let transport = TestTransportCost::new_shared();
+    let jobs = Arc::new(Jobs::new(&fleet, vec![job.clone()], transport.as_ref(), &test_logger()).unwrap());
+
+    let shared = TerritoryShared::new(
+        transport,
+        vec![actor],
+        jobs,
+        Arc::new(|_: &Job, _: &Actor| true),
+        TerritoryProximity::Distance,
+        Some(TerritoryBalance::Duration),
+        0.0,
+        HashMap::from([("d0".to_string(), vec![0usize])]),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        Arc::new(|_: &Job| 1.0),
+        false,
+    );
+
+    // Round trip 0 -> 5 -> 0 is 10, the visit is 600.
+    assert_eq!(shared.job_metric(&job), 610.0, "the total keeps the travel");
+    assert_eq!(shared.insertion_metric(&job), 600.0, "the marginal does not");
 }

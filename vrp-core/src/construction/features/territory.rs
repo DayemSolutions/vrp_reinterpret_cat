@@ -773,6 +773,42 @@ impl TerritoryShared {
             .collect()
     }
 
+    /// What inserting ONE job into a route actually adds to that route's load.
+    ///
+    /// ⚠️ Deliberately not [`Self::job_travel_estimate`], which answers a different question: what a
+    /// job is worth to the problem's TOTAL, and so what a derived quota should be sized from.
+    ///
+    /// Inserting a job adds its service exactly, and its drive only as a DETOUR — a few minutes
+    /// between two neighbours, not the round trip from a depot. Estimating `Duration` at the round
+    /// trip made the marginal large, roughly equal for every job, and therefore nearly free of the
+    /// discrimination a marginal exists to provide, while mis-scaling it against PULL. Service
+    /// alone is the part exactly knowable here, and on a field-service day it is the part that
+    /// dominates.
+    ///
+    /// `Distance` keeps the travel: there the drive IS the load, and an estimate without it would
+    /// be zero.
+    fn insertion_metric(&self, job: &Job) -> Float {
+        match self.balance {
+            None => 0.0,
+            Some(TerritoryBalance::Duration) | Some(TerritoryBalance::Service) => self.service_share(job),
+            _ => self.job_metric(job),
+        }
+    }
+
+    /// What one job is worth to the balance, as an ESTIMATE for the insertion marginal and for
+    /// `avg_metric`'s unit conversion.
+    ///
+    /// ⚠️ `Duration` deliberately estimates a job at its SERVICE time alone, though its route load
+    /// is service plus drive. Inserting a job into a route adds its service exactly and its drive
+    /// only as a DETOUR — a few minutes between two neighbours, not the round trip from a depot
+    /// this function can see. Carrying the round trip made the estimate large, roughly equal for
+    /// every job, and therefore almost free of the discrimination a marginal exists to provide,
+    /// while mis-scaling it against PULL. Service alone is the part that is exactly knowable here,
+    /// and it is the part that dominates.
+    ///
+    /// `Distance` keeps the round trip: there the drive IS the load, so an estimate without it
+    /// would be zero.
+
     /// What the job itself adds to the balance quantity, beside the travel to reach it.
     ///
     /// ⚠️ For `Duration` that is its SERVICE time, and leaving it out is not a rounding error:
@@ -819,7 +855,9 @@ impl TerritoryShared {
         }
         let all = jobs.all();
         let n = all.len().max(1);
-        let total: Float = all.iter().map(|j| self.job_metric(j)).sum();
+        // Averaged over the INSERTION metric, because that is what `push_marginal` divides by:
+        // the ratio has to be dimensionless, so both sides must measure the same thing.
+        let total: Float = all.iter().map(|j| self.insertion_metric(j)).sum();
         (total / n as Float).max(1e-9)
     }
 
@@ -1102,7 +1140,7 @@ impl TerritoryShared {
             reference
         };
         let gap = min_other - assigned_power;
-        let value_factor = self.job_metric(job) / self.avg_metric;
+        let value_factor = self.insertion_metric(job) / self.avg_metric;
         // Derivative of the convex PUSH, `2 · GAIN · surplus / quota`: the price rises with how far
         // over the band this route sits, so a flat step is replaced by pressure that grows with the
         // imbalance it prices — on the same scale as the fitness rather than a fraction of it.
